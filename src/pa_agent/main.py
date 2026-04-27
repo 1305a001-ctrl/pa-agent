@@ -18,6 +18,7 @@ import redis.asyncio as aioredis
 import sentry_sdk
 
 from pa_agent import alerts
+from pa_agent.bot import bot_loop
 from pa_agent.brief import build_and_send_brief
 from pa_agent.db import db
 from pa_agent.models import Signal
@@ -110,7 +111,7 @@ async def main() -> None:
     log.info("pa-agent starting (halt=%s)", settings.pa_agent_halt)
     await db.connect()
     try:
-        await asyncio.gather(critical_loop(), brief_loop())
+        await asyncio.gather(critical_loop(), brief_loop(), bot_loop())
     finally:
         await db.close()
 

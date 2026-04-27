@@ -1,9 +1,19 @@
 # pa-agent
 
-Phase 8 v0.1 — personal-assistant daemon. First two features:
+Phase 8 — personal-assistant daemon.
+
+**v0.1 features (live)**
 
 1. **Signals:critical Telegram alerts** — high-conviction signals (composite risk > 0.85) get pushed instantly with a rich format.
 2. **Daily brief** — once a day at `BRIEF_LOCAL_HOUR` (default 08:00 in `BRIEF_TIMEZONE`), summarize the previous 24h and push to Telegram. Optionally polished by the LLM if `LITELLM_API_KEY` is set.
+
+**v0.2 features (live)**
+
+3. **Telegram bot commands** — DM the bot from your phone. Authorized only for the configured `TELEGRAM_CHAT_ID`; every other chat is silently ignored.
+   - `/help`   — list commands
+   - `/status` — open positions + last pipeline run
+   - `/brief`  — fire the daily brief on demand
+   - `/ping`   — health check
 
 For system context, read [`infra-core/docs/ARCHITECTURE.md`](https://github.com/1305a001-ctrl/infra-core/blob/main/docs/ARCHITECTURE.md) first.
 
@@ -11,12 +21,13 @@ For system context, read [`infra-core/docs/ARCHITECTURE.md`](https://github.com/
 
 ```
 src/pa_agent/
-├── main.py            # asyncio entry — runs critical_loop + brief_loop
+├── main.py            # asyncio entry — runs critical_loop + brief_loop + bot_loop
 ├── settings.py        # pydantic-settings; env vars
 ├── db.py              # asyncpg pool + JSONB codec; READ-ONLY queries
 ├── models.py          # Signal pydantic type (mirrors news-consolidator)
 ├── alerts.py          # Telegram delivery + format_critical()
-└── brief.py           # 24h aggregation + optional LLM polish
+├── brief.py           # 24h aggregation + optional LLM polish
+└── bot.py             # Telegram long-polling bot — dispatches /commands
 ```
 
 `db.py` only reads — pa-agent doesn't own any tables. It joins across `market_signals`, `trades`, `poly_positions`, `pipeline_audit`.
