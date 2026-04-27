@@ -12,12 +12,15 @@ Commands:
     /status            current open positions + last pipeline run
     /brief             fire the daily brief on demand
     /ping              health check
+    /halt              stop trading-agent + poly-agent from opening new positions
+    /resume            clear the halt
 """
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 
 import httpx
+import redis.asyncio as aioredis
 
 from pa_agent import alerts
 from pa_agent.brief import build_and_send_brief
@@ -27,13 +30,25 @@ from pa_agent.settings import settings
 log = logging.getLogger(__name__)
 
 LONG_POLL_TIMEOUT = 30
+HALT_KEY = "system:halt"
 HELP_TEXT = (
     "<b>pa-agent commands</b>\n"
     "/status   open positions + last pipeline run\n"
     "/brief    fire the daily brief now\n"
+    "/halt     stop trading + poly agents from opening new positions\n"
+    "/resume   clear the halt\n"
     "/ping     health check\n"
     "/help     this message"
 )
+
+_redis: aioredis.Redis | None = None
+
+
+def _r() -> aioredis.Redis:
+    global _redis
+    if _redis is None:
+        _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+    return _redis
 
 
 async def bot_loop() -> None:
@@ -117,6 +132,26 @@ async def _handle(update: dict) -> None:
         except Exception as exc:  # noqa: BLE001
             log.exception("Manual brief failed")
             await alerts.telegram(f"❌ brief failed: {exc}")
+    elif cmd == "/halt":
+        try:
+            await _r().set(HALT_KEY, "1")
+            await alerts.telegram(
+                "🛑 <b>HALT</b> set\n"
+                "trading-agent + poly-agent will stop opening new positions within ~5s.\n"
+                "Existing positions exit normally on TP/SL/time-stop.\n"
+                "Send <code>/resume</code> to clear."
+            )
+        except Exception as exc:  # noqa: BLE001
+            await alerts.telegram(f"❌ halt failed: {exc}")
+    elif cmd == "/resume":
+        try:
+            await _r().delete(HALT_KEY)
+            await alerts.telegram(
+                "▶️ <b>RESUMED</b>\n"
+                "agents will pick up new signals on next message.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            await alerts.telegram(f"❌ resume failed: {exc}")
     else:
         await alerts.telegram(f"unknown command {cmd}\n\n{HELP_TEXT}")
 
@@ -132,7 +167,15 @@ async def _status_text() -> str:
         p for p in await db.poly_positions_since(cutoff) if p["status"] in ("open", "pending")
     ]
 
+    halted = False
+    try:
+        halted = bool(await _r().get(HALT_KEY))
+    except Exception:  # noqa: BLE001
+        pass
+
     lines = ["<b>📊 status</b>"]
+    if halted:
+        lines.append("🛑 system HALTED — agents not opening new positions")
 
     if runs:
         last = runs[0]
