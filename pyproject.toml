@@ -19,6 +19,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "structlog>=24.1",
     "sentry-sdk>=2.0",
+    "signals-contract @ https://github.com/1305a001-ctrl/signals-contract/archive/refs/tags/v0.1.0.tar.gz",
 ]
 
 [project.optional-dependencies]
