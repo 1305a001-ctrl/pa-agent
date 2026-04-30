@@ -1,6 +1,8 @@
 """Daily brief generator — pulls 24h of signals/trades/positions and summarizes via LLM."""
 import logging
+import re
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from openai import AsyncOpenAI
 
@@ -21,15 +23,54 @@ async def build_and_send_brief() -> None:
 
     text = _format_brief(signals, trades, positions, runs)
 
+    # Optionally enrich with recent CommandCenter memory entries so the LLM polish
+    # has Ben's evolving context (corrections, decisions, learnings).
+    extra_context = ""
+    if settings.commandcenter_path:
+        try:
+            extra_context = _load_commandcenter_memory(
+                Path(settings.commandcenter_path),
+                limit=settings.commandcenter_memory_entries,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to load CommandCenter memory; continuing without")
+
     # Run LLM summary on the structured brief if creds present, else send raw
     if settings.litellm_api_key:
         try:
-            text = await _llm_polish(text)
+            text = await _llm_polish(text, extra_context=extra_context)
         except Exception:  # noqa: BLE001
             log.exception("LLM polish failed; sending raw brief")
 
     sent = await alerts.telegram(text)
     log.info("Daily brief sent=%s len=%d", sent, len(text))
+
+
+def _load_commandcenter_memory(path: Path, limit: int = 5) -> str:
+    """Return the last `limit` dated entries from CommandCenter's _system/memory.md.
+
+    Memory entries are markdown sections starting with `## YYYY-MM-DD`. The
+    file header (text before the first dated section) is dropped. Returns an
+    empty string if the file is missing or has no dated entries.
+    """
+    memory_file = path / "_system" / "memory.md"
+    if not memory_file.exists():
+        return ""
+
+    content = memory_file.read_text(encoding="utf-8")
+    # Split on lines that start a dated section.
+    parts = re.split(r"(?m)^(## \d{4}-\d{2}-\d{2}.*)$", content)
+    # parts is [header, h1, body1, h2, body2, ...]; pair headers with bodies.
+    entries: list[str] = []
+    for i in range(1, len(parts), 2):
+        header = parts[i].strip()
+        body = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        entries.append(f"{header}\n{body}".strip())
+
+    if not entries:
+        return ""
+
+    return "\n\n".join(entries[-limit:])
 
 
 def _format_brief(signals, trades, positions, runs) -> str:
@@ -105,16 +146,26 @@ def _pf(x: float | None) -> str:
     return f"{x:,.0f}"
 
 
-async def _llm_polish(structured: str) -> str:
-    """Optional: ask the LLM to rewrite the brief into a tighter narrative under 1500 chars."""
+async def _llm_polish(structured: str, extra_context: str = "") -> str:
+    """Ask the LLM to rewrite the brief into a tighter narrative under 1500 chars.
+
+    `extra_context` is appended as recent learnings about how the user works —
+    useful for personalising tone and emphasis. The LLM is instructed to use it
+    as background only, not to repeat it back.
+    """
     client = AsyncOpenAI(base_url=settings.litellm_base_url, api_key=settings.litellm_api_key)
+    context_block = (
+        f"\n\nRECENT CONTEXT (background only, do not quote back):\n{extra_context}"
+        if extra_context
+        else ""
+    )
     prompt = (
         "You're writing a daily brief for the system owner. Below is structured data "
         "from the past 24h. Produce a 4-6 line HTML-formatted Telegram message that "
         "highlights what matters: pipeline health, open positions, any wins/losses, "
         "and one or two notable signals. Keep it punchy. Preserve Telegram <b> tags. "
         "No code blocks. Don't invent data not present below.\n\n"
-        f"DATA:\n{structured}"
+        f"DATA:\n{structured}{context_block}"
     )
     r = await client.chat.completions.create(
         model=settings.litellm_model,

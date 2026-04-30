@@ -28,5 +28,11 @@ class Settings(BaseSettings):
     # Kill switch
     pa_agent_halt: bool = False
 
+    # CommandCenter context — Mac-side personal-life workspace cloned read-only on ai-primary.
+    # When set + path exists, brief_loop reads recent memory entries and injects them into
+    # the LLM polish prompt so the daily brief reflects Ben's evolving context.
+    commandcenter_path: str = "/home/benadmin/commandcenter"
+    commandcenter_memory_entries: int = 5
+
 
 settings = Settings()
