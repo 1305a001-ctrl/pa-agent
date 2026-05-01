@@ -14,9 +14,11 @@ Commands:
     /ping              health check
     /halt              stop trading-agent + poly-agent from opening new positions
     /resume            clear the halt
+    /q <SQL>           read-only postgres query (PGOPTIONS-enforced)
 """
 import asyncio
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -37,9 +39,30 @@ HELP_TEXT = (
     "/brief    fire the daily brief now\n"
     "/halt     stop trading + poly agents from opening new positions\n"
     "/resume   clear the halt\n"
+    "/q       <code>SELECT ...</code> read-only postgres query (no writes)\n"
+    "/run     <code>&lt;skill&gt;</code> fire a CommandCenter runner\n"
+    "/enable  <code>&lt;skill&gt;</code> enable runner timer\n"
+    "/disable <code>&lt;skill&gt;</code> disable runner timer\n"
+    "/timers   show next-fire times of cc-* timers\n"
+    "/logs    <code>&lt;skill&gt; [N]</code> tail last N journal lines\n"
     "/ping     health check\n"
     "/help     this message"
 )
+
+# Allowed skill names that map to cc-<name>.service on ai-primary.
+# Match cc-controller/listener.sh ALLOWED_SKILLS list.
+_ALLOWED_RUNNERS = {"morning-brief", "trading-research-daily", "evening-review"}
+
+# Defence-in-depth lint for /q. Real protection is the read-only role
+# enforced server-side (PGOPTIONS in db.py); this gives a friendlier error.
+_WRITE_KEYWORDS_RE = re.compile(
+    r"(^|[^a-z_])(INSERT|UPDATE|DELETE|TRUNCATE|DROP|ALTER|CREATE|"
+    r"GRANT|REVOKE|MERGE|REINDEX|VACUUM|CLUSTER|REFRESH|LOCK|COPY)([^a-z_]|$)",
+    re.IGNORECASE,
+)
+_STRING_LITERAL_RE = re.compile(r"'[^']*'")
+_MAX_Q_ROWS = 30
+_MAX_Q_CELL_LEN = 60
 
 _redis: aioredis.Redis | None = None
 
@@ -152,8 +175,121 @@ async def _handle(update: dict) -> None:
             )
         except Exception as exc:  # noqa: BLE001
             await alerts.telegram(f"❌ resume failed: {exc}")
+    elif cmd == "/q":
+        # Strip the /q prefix and any leading whitespace
+        sql = text[len("/q"):].strip()
+        await alerts.telegram(await _q_text(sql))
+    elif cmd == "/run":
+        await _publish_control("cc:run", text, "/run", _runner_arg_required=True)
+    elif cmd == "/enable":
+        await _publish_control("cc:enable", text, "/enable", _runner_arg_required=True)
+    elif cmd == "/disable":
+        await _publish_control("cc:disable", text, "/disable", _runner_arg_required=True)
+    elif cmd == "/timers":
+        await _publish_control("cc:status", text, "/timers", _runner_arg_required=False)
+    elif cmd == "/logs":
+        await _publish_control("cc:logs", text, "/logs", _runner_arg_required=True)
     else:
         await alerts.telegram(f"unknown command {cmd}\n\n{HELP_TEXT}")
+
+
+async def _publish_control(channel: str, full_text: str, cmd_label: str,
+                            *, _runner_arg_required: bool) -> None:
+    """Publish a /run-style command to Redis for the host-side cc-controller.
+
+    The cc-controller listens on these channels, validates the skill name
+    against its own allowlist, runs the corresponding systemctl command,
+    and Telegrams the result back DIRECTLY (so this function only confirms
+    the publish; the user sees ⏳ then ✅/❌ from the controller).
+    """
+    parts = full_text.split(maxsplit=1)
+    payload = parts[1].strip() if len(parts) > 1 else ""
+
+    if _runner_arg_required:
+        if not payload:
+            await alerts.telegram(f"{cmd_label} usage: <code>{cmd_label} morning-brief</code>")
+            return
+        # Pre-validate the first token against pa-agent's allowlist (defence in depth;
+        # cc-controller has the final say). Allows /logs with optional N argument.
+        skill = payload.split()[0]
+        if skill not in _ALLOWED_RUNNERS:
+            allowed = ", ".join(sorted(_ALLOWED_RUNNERS))
+            await alerts.telegram(
+                f"❌ unknown skill <code>{skill}</code>%0AAllowed: {allowed}"
+            )
+            return
+
+    try:
+        await _r().publish(channel, payload)
+    except Exception as exc:  # noqa: BLE001
+        await alerts.telegram(f"❌ {cmd_label} publish failed: {exc}")
+        return
+
+    # Light ack — the controller will Telegram the actual result.
+    log.info("Published to %s: %r", channel, payload)
+
+
+async def _q_text(sql: str) -> str:
+    """Run a read-only postgres query and format result for Telegram."""
+    if not sql:
+        return ("<b>/q usage</b>\n"
+                "<code>/q SELECT COUNT(*) FROM trades;</code>\n\n"
+                "Read-only — INSERT/UPDATE/DELETE/etc. are refused.")
+
+    # Lint: strip string literals first, then check for write keywords
+    stripped = _STRING_LITERAL_RE.sub("", sql)
+    if _WRITE_KEYWORDS_RE.search(stripped):
+        return ("❌ REFUSED: query contains a write/DDL keyword.\n"
+                "<code>/q</code> is read-only. Use control-plane UI for mutations.")
+
+    # Run the query inside an explicit read-only transaction (server-side
+    # enforcement — bullet-proof against CTE-smuggled writes).
+    try:
+        async with db.pool.acquire() as conn:
+            async with conn.transaction(readonly=True):
+                rows = await conn.fetch(sql)
+    except Exception as exc:  # noqa: BLE001
+        return f"❌ query failed:\n<code>{_escape(str(exc)[:300])}</code>"
+
+    if not rows:
+        return "<i>(no rows)</i>"
+
+    truncated = len(rows) > _MAX_Q_ROWS
+    rows = rows[:_MAX_Q_ROWS]
+
+    # Format as a fixed-width-ish table for Telegram (HTML <pre>)
+    columns = list(rows[0].keys())
+    body_rows = []
+    for r in rows:
+        body_rows.append([_truncate(str(r[c]) if r[c] is not None else "—") for c in columns])
+
+    # Compute column widths
+    widths = [
+        max(len(c), max((len(row[i]) for row in body_rows), default=0))
+        for i, c in enumerate(columns)
+    ]
+    header_line = " | ".join(c.ljust(widths[i]) for i, c in enumerate(columns))
+    sep_line = "-+-".join("-" * w for w in widths)
+    lines = [header_line, sep_line]
+    for row in body_rows:
+        lines.append(" | ".join(row[i].ljust(widths[i]) for i in range(len(columns))))
+
+    table = "\n".join(lines)
+    note = ""
+    if truncated:
+        total = len(rows) + 1  # at least one more existed
+        note = f"\n\n<i>{len(rows)} of {total}+ rows shown</i>"
+    return f"<pre>{_escape(table)}</pre>{note}"
+
+
+def _truncate(s: str) -> str:
+    s = s.replace("\n", " ").replace("\r", " ")
+    return s if len(s) <= _MAX_Q_CELL_LEN else s[: _MAX_Q_CELL_LEN - 1] + "…"
+
+
+def _escape(s: str) -> str:
+    """Escape for HTML parse_mode in Telegram."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ─── Status formatter ───────────────────────────────────────────────────────
