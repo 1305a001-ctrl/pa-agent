@@ -40,9 +40,18 @@ HELP_TEXT = (
     "/halt     stop trading + poly agents from opening new positions\n"
     "/resume   clear the halt\n"
     "/q       <code>SELECT ...</code> read-only postgres query (no writes)\n"
+    "/run     <code>&lt;skill&gt;</code> fire a CommandCenter runner\n"
+    "/enable  <code>&lt;skill&gt;</code> enable runner timer\n"
+    "/disable <code>&lt;skill&gt;</code> disable runner timer\n"
+    "/timers   show next-fire times of cc-* timers\n"
+    "/logs    <code>&lt;skill&gt; [N]</code> tail last N journal lines\n"
     "/ping     health check\n"
     "/help     this message"
 )
+
+# Allowed skill names that map to cc-<name>.service on ai-primary.
+# Match cc-controller/listener.sh ALLOWED_SKILLS list.
+_ALLOWED_RUNNERS = {"morning-brief", "trading-research-daily", "evening-review"}
 
 # Defence-in-depth lint for /q. Real protection is the read-only role
 # enforced server-side (PGOPTIONS in db.py); this gives a friendlier error.
@@ -170,8 +179,54 @@ async def _handle(update: dict) -> None:
         # Strip the /q prefix and any leading whitespace
         sql = text[len("/q"):].strip()
         await alerts.telegram(await _q_text(sql))
+    elif cmd == "/run":
+        await _publish_control("cc:run", text, "/run", _runner_arg_required=True)
+    elif cmd == "/enable":
+        await _publish_control("cc:enable", text, "/enable", _runner_arg_required=True)
+    elif cmd == "/disable":
+        await _publish_control("cc:disable", text, "/disable", _runner_arg_required=True)
+    elif cmd == "/timers":
+        await _publish_control("cc:status", text, "/timers", _runner_arg_required=False)
+    elif cmd == "/logs":
+        await _publish_control("cc:logs", text, "/logs", _runner_arg_required=True)
     else:
         await alerts.telegram(f"unknown command {cmd}\n\n{HELP_TEXT}")
+
+
+async def _publish_control(channel: str, full_text: str, cmd_label: str,
+                            *, _runner_arg_required: bool) -> None:
+    """Publish a /run-style command to Redis for the host-side cc-controller.
+
+    The cc-controller listens on these channels, validates the skill name
+    against its own allowlist, runs the corresponding systemctl command,
+    and Telegrams the result back DIRECTLY (so this function only confirms
+    the publish; the user sees ⏳ then ✅/❌ from the controller).
+    """
+    parts = full_text.split(maxsplit=1)
+    payload = parts[1].strip() if len(parts) > 1 else ""
+
+    if _runner_arg_required:
+        if not payload:
+            await alerts.telegram(f"{cmd_label} usage: <code>{cmd_label} morning-brief</code>")
+            return
+        # Pre-validate the first token against pa-agent's allowlist (defence in depth;
+        # cc-controller has the final say). Allows /logs with optional N argument.
+        skill = payload.split()[0]
+        if skill not in _ALLOWED_RUNNERS:
+            allowed = ", ".join(sorted(_ALLOWED_RUNNERS))
+            await alerts.telegram(
+                f"❌ unknown skill <code>{skill}</code>%0AAllowed: {allowed}"
+            )
+            return
+
+    try:
+        await _r().publish(channel, payload)
+    except Exception as exc:  # noqa: BLE001
+        await alerts.telegram(f"❌ {cmd_label} publish failed: {exc}")
+        return
+
+    # Light ack — the controller will Telegram the actual result.
+    log.info("Published to %s: %r", channel, payload)
 
 
 async def _q_text(sql: str) -> str:
