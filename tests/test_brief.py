@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-from pa_agent.brief import _format_brief, _pf
+from pa_agent.brief import _format_brief, _load_commandcenter_memory, _pf
 from pa_agent.main import _next_brief_at
 from pa_agent.settings import settings
 
@@ -59,6 +60,42 @@ def test_pf_formatting():
     assert _pf(0.525) == "0.525"
     assert _pf(78014.95) == "78,015"
     assert _pf(1.5) == "1.50"
+
+
+def test_load_commandcenter_memory_missing_path(tmp_path: Path):
+    # Path exists but no _system/memory.md inside
+    out = _load_commandcenter_memory(tmp_path)
+    assert out == ""
+
+
+def test_load_commandcenter_memory_no_dated_entries(tmp_path: Path):
+    (tmp_path / "_system").mkdir()
+    (tmp_path / "_system" / "memory.md").write_text("# Memory\n\nNo dated sections here.\n")
+    assert _load_commandcenter_memory(tmp_path) == ""
+
+
+def test_load_commandcenter_memory_returns_last_n(tmp_path: Path):
+    (tmp_path / "_system").mkdir()
+    (tmp_path / "_system" / "memory.md").write_text(
+        "# Memory — header text\n\n"
+        "## 2026-04-28 — first\nbody one\n\n"
+        "## 2026-04-29 — second\nbody two\n\n"
+        "## 2026-04-30 — third\nbody three\n"
+    )
+    out = _load_commandcenter_memory(tmp_path, limit=2)
+    # Header dropped; only last two entries returned in order.
+    assert "## 2026-04-28 — first" not in out
+    assert "## 2026-04-29 — second" in out
+    assert "## 2026-04-30 — third" in out
+    assert "header text" not in out
+
+
+def test_load_commandcenter_memory_limit_larger_than_entries(tmp_path: Path):
+    (tmp_path / "_system").mkdir()
+    (tmp_path / "_system" / "memory.md").write_text("## 2026-04-30 — only entry\nbody\n")
+    out = _load_commandcenter_memory(tmp_path, limit=5)
+    assert "## 2026-04-30 — only entry" in out
+    assert "body" in out
 
 
 def test_next_brief_returns_future_utc():
