@@ -10,7 +10,7 @@ End-to-end command behaviour (redis+alerts.telegram) is covered by the
 integration tests + manual smoke once deployed.
 """
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest

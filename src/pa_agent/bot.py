@@ -442,7 +442,7 @@ async def _cmd_flat() -> None:
         await alerts.telegram(
             "⚠️ <b>FLAT</b> requested\n"
             "1. system:halt set (no new entries)\n"
-            f"2. published to <code>{FLAT_CHANNEL}</code> — OMS will close all open positions at market.\n\n"
+            f"2. published to <code>{FLAT_CHANNEL}</code> — OMS will close all open at market.\n\n"
             "When the OMS hasn't yet been built, this command is a no-op for closing positions "
             "(but the halt still fires). Confirm with <code>/status</code> after."
         )
