@@ -12,14 +12,30 @@ Commands:
     /status            current open positions + last pipeline run
     /brief             fire the daily brief on demand
     /ping              health check
-    /halt              stop trading-agent + poly-agent from opening new positions
-    /resume            clear the halt
+    /halt              stop ALL agents from opening new positions (redis system:halt)
+    /halt-strategy <slug>  pause one strategy (redis system:halt:<slug>)
+    /resume            clear the global halt
+    /flat              close ALL open positions to flat (publishes oms:flat-all)
+    /reset-tomorrow    schedule auto-clear of system:halt at 04:00 +08
+    /kill-status       show active halts + recent kill events
     /q <SQL>           read-only postgres query (PGOPTIONS-enforced)
+    /run /enable /disable /timers /logs   skill runner control (cc-controller)
+
+Kill-switch design (project_trading_stack.md, level 5 = manual):
+    - All kill events publish to Redis stream `risk:alerts` for downstream
+      consumers (kill_events persistence worker — Phase 1F — drains this).
+    - Halts are stored as Redis keys (`system:halt`, `system:halt:<slug>`)
+      so trading-agent / poly-agent can check synchronously without a DB hit.
+    - /flat publishes to channel `oms:flat-all`; the OMS subscribes and
+      closes all open positions at market on receipt.
 """
 import asyncio
+import json
 import logging
 import re
-from datetime import UTC, datetime, timedelta
+import uuid
+from datetime import UTC, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import httpx
 import redis.asyncio as aioredis
@@ -33,13 +49,26 @@ log = logging.getLogger(__name__)
 
 LONG_POLL_TIMEOUT = 30
 HALT_KEY = "system:halt"
+HALT_PREFIX = "system:halt:"  # per-strategy halts: system:halt:<slug>
+RISK_ALERTS_STREAM = "risk:alerts"
+FLAT_CHANNEL = "oms:flat-all"
+RESET_KEY = "system:halt:reset_at"  # ISO timestamp when halt should auto-clear
+MYT = ZoneInfo("Asia/Kuala_Lumpur")  # +08, for /reset-tomorrow scheduling
+KILL_EVENT_MAX_HISTORY = 10
 HELP_TEXT = (
     "<b>pa-agent commands</b>\n"
+    "<b>Kill switch (L5 — manual):</b>\n"
+    "/halt              halt ALL agents (no new positions)\n"
+    "/halt-strategy <code>&lt;slug&gt;</code>  pause one strategy\n"
+    "/resume            clear the global halt\n"
+    "/flat              close ALL open positions to flat (destructive)\n"
+    "/reset-tomorrow    auto-clear /halt at 04:00 +08\n"
+    "/kill-status       show active halts + recent events\n"
+    "\n"
+    "<b>Ops:</b>\n"
     "/status   open positions + last pipeline run\n"
     "/brief    fire the daily brief now\n"
-    "/halt     stop trading + poly agents from opening new positions\n"
-    "/resume   clear the halt\n"
-    "/q       <code>SELECT ...</code> read-only postgres query (no writes)\n"
+    "/q       <code>SELECT ...</code> read-only postgres query\n"
     "/run     <code>&lt;skill&gt;</code> fire a CommandCenter runner\n"
     "/enable  <code>&lt;skill&gt;</code> enable runner timer\n"
     "/disable <code>&lt;skill&gt;</code> disable runner timer\n"
@@ -158,23 +187,34 @@ async def _handle(update: dict) -> None:
     elif cmd == "/halt":
         try:
             await _r().set(HALT_KEY, "1")
+            await _emit_kill_event(kind="manual_halt_all", scope="all", reason="Telegram /halt")
             await alerts.telegram(
                 "🛑 <b>HALT</b> set\n"
                 "trading-agent + poly-agent will stop opening new positions within ~5s.\n"
-                "Existing positions exit normally on TP/SL/time-stop.\n"
-                "Send <code>/resume</code> to clear."
+                "Existing positions exit normally on TP/SL/trailing-stop.\n"
+                "Send <code>/resume</code> to clear, <code>/flat</code> to close all."
             )
         except Exception as exc:  # noqa: BLE001
             await alerts.telegram(f"❌ halt failed: {exc}")
+    elif cmd == "/halt-strategy":
+        await _cmd_halt_strategy(text)
     elif cmd == "/resume":
         try:
             await _r().delete(HALT_KEY)
+            await _r().delete(RESET_KEY)  # cancel any pending reset-tomorrow
+            await _emit_kill_event(kind="manual_resume", scope="all", reason="Telegram /resume")
             await alerts.telegram(
                 "▶️ <b>RESUMED</b>\n"
                 "agents will pick up new signals on next message.",
             )
         except Exception as exc:  # noqa: BLE001
             await alerts.telegram(f"❌ resume failed: {exc}")
+    elif cmd == "/flat":
+        await _cmd_flat()
+    elif cmd == "/reset-tomorrow":
+        await _cmd_reset_tomorrow()
+    elif cmd == "/kill-status":
+        await alerts.telegram(await _kill_status_text())
     elif cmd == "/q":
         # Strip the /q prefix and any leading whitespace
         sql = text[len("/q"):].strip()
@@ -290,6 +330,219 @@ def _truncate(s: str) -> str:
 def _escape(s: str) -> str:
     """Escape for HTML parse_mode in Telegram."""
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ─── Kill switch (L5 manual) ────────────────────────────────────────────────
+
+
+async def _emit_kill_event(
+    *,
+    kind: str,
+    scope: str = "all",
+    level: int = 5,
+    reason: str | None = None,
+    metadata: dict | None = None,
+    actor: str | None = None,
+) -> str:
+    """Publish a KillEvent to redis stream `risk:alerts`.
+
+    Returns the redis stream entry id. Callers should not depend on this
+    write completing for user-facing acks; a separate persistence worker
+    drains the stream into the kill_events postgres table.
+
+    NOTE: pa-agent is a read-only postgres client (db.py docstring). The
+    kill_events table is intentionally NOT written from here — that's the
+    job of the kill-events persistence worker (Phase 1F). All audit fan-out
+    flows through the redis stream first.
+    """
+    actor = actor or f"telegram:{settings.telegram_chat_id or 'unknown'}"
+    payload = {
+        "id": str(uuid.uuid4()),
+        "triggered_at": datetime.now(UTC).isoformat(),
+        "level": level,
+        "kind": kind,
+        "scope": scope,
+        "actor": actor,
+        "reason": reason,
+        "metadata": metadata or {},
+    }
+    try:
+        return await _r().xadd(
+            RISK_ALERTS_STREAM,
+            {"data": json.dumps(payload)},
+            maxlen=10_000,
+            approximate=True,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to emit kill_event to %s", RISK_ALERTS_STREAM)
+        return ""
+
+
+_STRATEGY_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+
+async def _cmd_halt_strategy(full_text: str) -> None:
+    """`/halt-strategy <slug>` — pause one strategy.
+
+    The slug isn't validated against any DB list (strategies + agent_configs
+    are owned by other services); we only sanity-check the format. Setting
+    the halt key on an unknown slug is harmless — no consumer reads it.
+    """
+    parts = full_text.split(maxsplit=1)
+    if len(parts) < 2:
+        await alerts.telegram(
+            "<b>/halt-strategy usage</b>\n"
+            "<code>/halt-strategy btc-momentum</code>\n\n"
+            "Sets <code>system:halt:&lt;slug&gt;</code>. The matching strategy stops opening "
+            "new positions on next signal check (~5s). Existing positions exit normally."
+        )
+        return
+    slug = parts[1].strip().lower()
+    if not _STRATEGY_SLUG_RE.match(slug):
+        await alerts.telegram(
+            f"❌ invalid slug <code>{_escape(slug)}</code>\n"
+            "Slugs are lowercase a-z, 0-9, and dashes; max 64 chars."
+        )
+        return
+    try:
+        await _r().set(f"{HALT_PREFIX}{slug}", "1")
+        await _emit_kill_event(
+            kind="manual_halt_strategy",
+            scope=f"strategy:{slug}",
+            reason=f"Telegram /halt-strategy {slug}",
+            metadata={"strategy_slug": slug},
+        )
+        await alerts.telegram(
+            f"🛑 <b>HALT-STRATEGY</b> {slug}\n"
+            f"<code>system:halt:{slug}</code> set.\n"
+            "Other strategies continue trading. "
+            f"Clear with <code>/q DEL system:halt:{slug}</code> via redis-cli, "
+            "or just <code>/resume</code> for global resume."
+        )
+    except Exception as exc:  # noqa: BLE001
+        await alerts.telegram(f"❌ halt-strategy failed: {exc}")
+
+
+async def _cmd_flat() -> None:
+    """`/flat` — instruct the OMS to close ALL open positions at market.
+
+    Publishes to channel `oms:flat-all`. The OMS subscribes to this channel
+    and closes everything on receipt. ALSO sets the global halt so no new
+    entries fire while we're flattening.
+    """
+    try:
+        await _r().set(HALT_KEY, "1")
+        await _r().publish(FLAT_CHANNEL, "1")
+        await _emit_kill_event(
+            kind="manual_flat",
+            scope="all",
+            reason="Telegram /flat",
+            metadata={"halt_set": True, "channel": FLAT_CHANNEL},
+        )
+        await alerts.telegram(
+            "⚠️ <b>FLAT</b> requested\n"
+            "1. system:halt set (no new entries)\n"
+            f"2. published to <code>{FLAT_CHANNEL}</code> — OMS will close all open positions at market.\n\n"
+            "When the OMS hasn't yet been built, this command is a no-op for closing positions "
+            "(but the halt still fires). Confirm with <code>/status</code> after."
+        )
+    except Exception as exc:  # noqa: BLE001
+        await alerts.telegram(f"❌ flat failed: {exc}")
+
+
+async def _cmd_reset_tomorrow() -> None:
+    """`/reset-tomorrow` — schedule auto-clear of system:halt at 04:00 +08.
+
+    Stores the target ISO timestamp at `system:halt:reset_at`. A separate
+    scheduled worker (Phase 1F) reads this and clears HALT_KEY + RESET_KEY
+    when the time arrives. Without that worker, this is informational —
+    the halt does NOT auto-clear; you'd still need to /resume manually.
+    """
+    now = datetime.now(MYT)
+    target = datetime.combine(now.date() + timedelta(days=1), time(4, 0), tzinfo=MYT)
+    try:
+        await _r().set(RESET_KEY, target.isoformat())
+        await _emit_kill_event(
+            kind="manual_reset_tomorrow",
+            scope="all",
+            reason=f"Auto-clear scheduled for {target.isoformat()}",
+            metadata={"reset_at": target.isoformat()},
+        )
+        ago = target.strftime("%Y-%m-%d %H:%M %Z")
+        await alerts.telegram(
+            f"⏰ <b>RESET-TOMORROW</b>\n"
+            f"system:halt scheduled to auto-clear at <b>{ago}</b>.\n\n"
+            "<i>Requires the kill-events worker to be running (Phase 1F).</i> "
+            "Until then, you'll still need to <code>/resume</code> manually. "
+            "The schedule itself is logged for the dashboard."
+        )
+    except Exception as exc:  # noqa: BLE001
+        await alerts.telegram(f"❌ reset-tomorrow failed: {exc}")
+
+
+async def _kill_status_text() -> str:
+    """Format the current halt state + recent kill events for Telegram."""
+    redis = _r()
+
+    # Active halts
+    halt_lines: list[str] = []
+    if await redis.exists(HALT_KEY):
+        halt_lines.append("🛑 GLOBAL HALT (system:halt)")
+    reset_at = await redis.get(RESET_KEY)
+    if reset_at:
+        halt_lines.append(f"⏰ auto-clear scheduled: {reset_at}")
+    # Per-strategy halts — scan keys (small N, OK)
+    cursor = 0
+    strategy_halts: list[str] = []
+    while True:
+        cursor, keys = await redis.scan(cursor, match=f"{HALT_PREFIX}*", count=100)
+        for key in keys:
+            if key == RESET_KEY:
+                continue
+            slug = key[len(HALT_PREFIX):]
+            if slug:
+                strategy_halts.append(slug)
+        if cursor == 0:
+            break
+    if strategy_halts:
+        halt_lines.append(
+            f"🛑 strategy halts ({len(strategy_halts)}): " + ", ".join(sorted(strategy_halts))
+        )
+    if not halt_lines:
+        halt_lines.append("✅ no active halts")
+
+    # Recent events from risk:alerts stream (last KILL_EVENT_MAX_HISTORY)
+    event_lines: list[str] = []
+    try:
+        entries = await redis.xrevrange(
+            RISK_ALERTS_STREAM, count=KILL_EVENT_MAX_HISTORY,
+        )
+    except Exception:  # noqa: BLE001
+        entries = []
+
+    for entry_id, fields in entries:
+        raw = fields.get("data") or fields.get(b"data")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            ev = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            continue
+        ts = ev.get("triggered_at", "")[:19].replace("T", " ")
+        kind = ev.get("kind", "?")
+        scope = ev.get("scope", "?")
+        actor = ev.get("actor", "?").split(":", 1)[-1]
+        event_lines.append(f"  {ts} {kind} ({scope}) by {actor}")
+
+    if not event_lines:
+        event_lines.append("  <i>no events in stream</i>")
+
+    return (
+        "<b>🚦 Kill status</b>\n\n"
+        "<b>Active halts:</b>\n" + "\n".join(halt_lines) + "\n\n"
+        f"<b>Recent events (last {KILL_EVENT_MAX_HISTORY} from risk:alerts):</b>\n"
+        + "\n".join(event_lines)
+    )
 
 
 # ─── Status formatter ───────────────────────────────────────────────────────
