@@ -672,7 +672,10 @@ async def answer_question(question: str, db=None, redis_client=None) -> str:
         )
         resp = await client.chat.completions.create(
             model=settings.litellm_model,
-            messages=messages,
+            # OpenAI types `messages` as a long union of TypedDicts; our
+            # `list[dict[str,str]]` shape is structurally equivalent. The
+            # type-ignore avoids a forced refactor to ChatCompletionMessageParam.
+            messages=messages,  # type: ignore[arg-type]
             temperature=0.4,
             max_tokens=600,
         )
