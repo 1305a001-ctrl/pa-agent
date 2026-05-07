@@ -65,6 +65,9 @@ HELP_TEXT = (
     "/reset-tomorrow    auto-clear /halt at 04:00 +08\n"
     "/kill-status       show active halts + recent events\n"
     "\n"
+    "<b>PA (personal assistant):</b>\n"
+    "/ask     <code>&lt;question&gt;</code> ask the PA — grounded in your CommandCenter\n"
+    "\n"
     "<b>Ops:</b>\n"
     "/status   open positions + last pipeline run\n"
     "/brief    fire the daily brief now\n"
@@ -175,6 +178,25 @@ async def _handle(update: dict) -> None:
         await alerts.telegram(HELP_TEXT)
     elif cmd == "/ping":
         await alerts.telegram("🟢 pong")
+    elif cmd == "/ask":
+        # Phase 8 v0.3 — PA Q&A grounded in CommandCenter context.
+        question = text[len("/ask"):].strip()
+        if not question:
+            await alerts.telegram(
+                "Ask me something. Examples:\n"
+                "  /ask what's on my plate this week\n"
+                "  /ask summarise the trading-stack pivot rationale\n"
+                "  /ask draft a reply to John about the Phase 6 hand-off"
+            )
+        else:
+            await alerts.telegram("⏳ thinking…")
+            try:
+                from pa_agent.pa import answer_question
+                answer = await answer_question(question)
+                await alerts.telegram(answer)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Manual /ask failed")
+                await alerts.telegram(f"❌ /ask failed: {exc}")
     elif cmd == "/status":
         await alerts.telegram(await _status_text())
     elif cmd == "/brief":
