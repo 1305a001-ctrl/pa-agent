@@ -1,13 +1,16 @@
-"""pa-agent daemon — Phase 8 v0.2.
+"""pa-agent daemon — Phase 8 v0.6.
 
-Three concurrent loops:
+Five concurrent loops:
   1. critical_loop      — subscribes to signals:critical, sends rich Telegram alerts
   2. brief_loop         — fires once per day at BRIEF_LOCAL_HOUR
-  3. corr_alert_loop    — XREADs risk:correlation_alerts (transition events from
+  3. bot_loop           — long-poll Telegram getUpdates for /ask /note /inbox /me /reset
+  4. corr_alert_loop    — XREADs risk:correlation_alerts (transition events from
                           risk-watcher v0.9), formats + sends Telegram brief on
                           cluster_forming / cluster_resolved.
-
-Future expansions: chat UI, calendar/email triage, ad-hoc Q&A.
+  5. inbox_pull_loop    — Gmail OAuth auto-pull (Phase 8 v0.6, dormant until creds
+                          provisioned). Triages new email + archives to
+                          _inbox/triage-YYYY-MM-DD.md, pushes high-urgency to
+                          Telegram.
 """
 import asyncio
 import json
@@ -23,6 +26,7 @@ from pa_agent import alerts
 from pa_agent.bot import bot_loop
 from pa_agent.brief import build_and_send_brief
 from pa_agent.db import db
+from pa_agent.inbox_loop import loop as inbox_pull_loop
 from pa_agent.models import Signal
 from pa_agent.settings import settings
 
@@ -168,6 +172,7 @@ async def main() -> None:
             brief_loop(),
             bot_loop(),
             corr_alert_loop(),
+            inbox_pull_loop(),
         )
     finally:
         await db.close()

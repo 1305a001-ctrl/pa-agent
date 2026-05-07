@@ -42,11 +42,65 @@ src/pa_agent/
 
 `PA_AGENT_HALT=1` skips both critical alerts and the daily brief without restarting the container.
 
+## Gmail OAuth — auto-pull /inbox triage
+
+The `inbox_pull_loop` (5th concurrent loop) auto-pulls unread Gmail messages, triages each via the existing `triage_inbox_text` LLM helper, archives to `_inbox/triage-YYYY-MM-DD.md`, and pushes high-urgency items to Telegram.
+
+**Stays dormant until all three OAuth env vars are set** — safe to ship without breaking existing manual-forward `/inbox` behaviour.
+
+### One-time setup (Ben)
+
+1. **Create a Google Cloud project** at https://console.cloud.google.com (or pick existing).
+2. **Enable Gmail API**: APIs & Services → Library → search "Gmail API" → Enable.
+3. **Configure OAuth consent screen**: APIs & Services → OAuth consent screen → External → fill in app name + your email → add scope `https://www.googleapis.com/auth/gmail.modify` → add yourself as test user.
+4. **Create OAuth client ID**: Credentials → "Create credentials" → OAuth client ID → application type "Desktop app" → name "pa-agent-inbox" → save.
+5. **Download** the client_id + client_secret.
+6. **Generate a refresh token** (one-time, on Mac):
+   ```bash
+   pip install google-auth-oauthlib
+   python3 - <<'PY'
+   from google_auth_oauthlib.flow import InstalledAppFlow
+   flow = InstalledAppFlow.from_client_config(
+       {"installed": {
+           "client_id": "<CLIENT_ID>",
+           "client_secret": "<CLIENT_SECRET>",
+           "redirect_uris": ["http://localhost"],
+           "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+           "token_uri": "https://oauth2.googleapis.com/token",
+       }},
+       scopes=["https://www.googleapis.com/auth/gmail.modify"],
+   )
+   creds = flow.run_local_server(port=0)
+   print("REFRESH TOKEN:", creds.refresh_token)
+   PY
+   ```
+   Sign in in the browser, grant access, copy the printed refresh token.
+7. **Provision pa-agent.env on ai-primary**:
+   ```
+   GMAIL_OAUTH_CLIENT_ID=...
+   GMAIL_OAUTH_CLIENT_SECRET=...
+   GMAIL_OAUTH_REFRESH_TOKEN=...
+   GMAIL_TELEGRAM_MIN_URGENCY=high
+   ```
+8. `docker compose up -d pa-agent` — the loop wakes up and starts pulling within `gmail_poll_interval_sec` (default 5 min).
+
+### Tunables
+
+| Env | Default | Notes |
+|---|---|---|
+| `GMAIL_QUERY` | `is:unread in:inbox` | Standard Gmail search syntax |
+| `GMAIL_POLL_INTERVAL_SEC` | `300` | 5 min cadence; Gmail daily quota is 1B requests |
+| `GMAIL_MAX_MESSAGES_PER_TICK` | `10` | Cap so a flood doesn't spam Telegram |
+| `GMAIL_TELEGRAM_MIN_URGENCY` | `high` | Only triages above this level get pushed to Telegram |
+
+### Deactivate
+
+Clear any one OAuth env var → reload pa-agent → loop goes dormant. The other 4 loops continue.
+
 ## Future expansions
 
 - Chat UI at `pa.the2357.com` (Telegram bot already covers ad-hoc Q&A)
 - Calendar integration (Google / Outlook)
-- Email triage
 - Task management
 
 These will be added as `src/pa_agent/<feature>.py` modules and wired into `main.py` as additional concurrent loops. New features must remain optional — pa-agent should keep working with just Postgres + Redis + Telegram.
