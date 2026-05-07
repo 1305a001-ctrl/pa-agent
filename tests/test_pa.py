@@ -259,3 +259,120 @@ def test_detect_templates_skips_missing_files(tmp_path: Path):
 def test_detect_templates_handles_missing_path():
     assert detect_template_files(None) == []
     assert detect_template_files("/nonexistent") == []
+
+
+# --- A4: build_me_summary ---------------------------------------------------
+
+
+def test_me_summary_marks_sections_filled_or_thin():
+    from pa_agent.pa import build_me_summary
+    ctx = {
+        "ABOUT BEN": "x" * 500,  # filled
+        "VOICE": "TEMPLATE — fill in",  # thin
+    }
+    out = build_me_summary(ctx)
+    assert "✅" in out
+    assert "🟡" in out
+    assert "About Ben" in out
+    assert "Voice" in out
+
+
+def test_me_summary_handles_empty_context():
+    from pa_agent.pa import build_me_summary
+    out = build_me_summary({})
+    assert "What I know about you" in out
+    # All sections marked thin since none present
+    assert out.count("🟡") >= 3
+
+
+def test_me_summary_includes_recent_memory_snippet():
+    from pa_agent.pa import build_me_summary
+    ctx = {
+        "RECENT MEMORY": "## 2026-05-08 — test entry\nThis is recent context.",
+    }
+    out = build_me_summary(ctx)
+    assert "Most recent memory entry" in out
+    assert "test entry" in out
+
+
+def test_me_summary_counts_quick_notes():
+    from pa_agent.pa import build_me_summary
+    ctx = {
+        "RECENT QUICK-NOTES": (
+            "## 12:00:00 UTC\nfirst\n\n## 13:00:00 UTC\nsecond\n\n## 14:00:00 UTC\nthird"
+        ),
+    }
+    out = build_me_summary(ctx)
+    assert "3 captured" in out
+
+
+# --- B: load_calendar_today -------------------------------------------------
+
+
+def test_calendar_today_returns_today_block(tmp_path: Path):
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from pa_agent.pa import load_calendar_today  # noqa: PLC0415
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    (tmp_path / "_inbox").mkdir()
+    (tmp_path / "_inbox" / "calendar.md").write_text(
+        f"## 2025-01-01\n- old event\n\n"
+        f"## {today}\n- 09:00 standup\n- 14:00 padel\n\n"
+        f"## 2099-12-31\n- future event\n",
+        encoding="utf-8",
+    )
+    out = load_calendar_today(tmp_path)
+    assert "09:00 standup" in out
+    assert "14:00 padel" in out
+    assert "old event" not in out
+    assert "future event" not in out
+
+
+def test_calendar_today_missing_file_returns_empty(tmp_path: Path):
+    from pa_agent.pa import load_calendar_today
+    assert load_calendar_today(tmp_path) == ""
+
+
+def test_calendar_today_no_today_section(tmp_path: Path):
+    from pa_agent.pa import load_calendar_today
+    (tmp_path / "_inbox").mkdir()
+    (tmp_path / "_inbox" / "calendar.md").write_text(
+        "## 2025-01-01\n- old\n", encoding="utf-8",
+    )
+    assert load_calendar_today(tmp_path) == ""
+
+
+# --- C: append_triage -------------------------------------------------------
+
+
+def test_append_triage_writes_record(tmp_path: Path):
+    from pa_agent.pa import append_triage
+    triage = {
+        "summary": "John wants Q3 budget review next week",
+        "action_items": "- reply confirming Tuesday\n- prep numbers",
+        "urgency": "high",
+        "category": "business",
+    }
+    target = append_triage(tmp_path, "From: john\nSubject: Q3 review", triage)
+    assert target is not None
+    content = target.read_text(encoding="utf-8")
+    assert "high" in content
+    assert "business" in content
+    assert "Q3 budget review" in content
+    assert "reply confirming Tuesday" in content
+    assert "From: john" in content  # original text preserved
+
+
+def test_append_triage_creates_file_with_header(tmp_path: Path):
+    from pa_agent.pa import append_triage
+    target = append_triage(tmp_path, "test", {
+        "summary": "x", "action_items": "", "urgency": "low", "category": "other",
+    })
+    assert target is not None
+    assert "Triage queue" in target.read_text(encoding="utf-8")
+
+
+def test_append_triage_empty_text_returns_none(tmp_path: Path):
+    from pa_agent.pa import append_triage
+    assert append_triage(tmp_path, "", {"summary": "x"}) is None
+    assert append_triage(tmp_path, "   ", {"summary": "x"}) is None
