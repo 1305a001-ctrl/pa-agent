@@ -1,9 +1,11 @@
-"""pa-agent daemon — Phase 8 v0.1.
+"""pa-agent daemon — Phase 8 v0.2.
 
-Two concurrent loops:
-  1. critical_loop  — subscribes to signals:critical, sends rich Telegram alerts
-  2. brief_loop     — fires once per day at BRIEF_LOCAL_HOUR (in BRIEF_TIMEZONE),
-                       summarizes the prior 24h via LLM, sends to Telegram
+Three concurrent loops:
+  1. critical_loop      — subscribes to signals:critical, sends rich Telegram alerts
+  2. brief_loop         — fires once per day at BRIEF_LOCAL_HOUR
+  3. corr_alert_loop    — XREADs risk:correlation_alerts (transition events from
+                          risk-watcher v0.9), formats + sends Telegram brief on
+                          cluster_forming / cluster_resolved.
 
 Future expansions: chat UI, calendar/email triage, ad-hoc Q&A.
 """
@@ -67,6 +69,50 @@ async def critical_loop() -> None:
             log.exception("Failed sending critical alert for %s", signal.id)
 
 
+# ─── Loop 3: correlation alerts (Phase 8 v0.2) ─────────────────────────────
+
+
+async def corr_alert_loop() -> None:
+    """XREAD risk:correlation_alerts from $ (latest) and surface transitions
+    to Telegram. Resilient to redis hiccups via exponential backoff.
+    """
+    r = aioredis.from_url(settings.redis_url, decode_responses=True)
+    last_id = "$"
+    backoff = 1.0
+    log.info("corr-alert loop starting; subscribing to %s", settings.correlation_alerts_stream)
+    while True:
+        try:
+            result = await r.xread(
+                {settings.correlation_alerts_stream: last_id},
+                block=10_000,
+                count=10,
+            )
+        except Exception:
+            log.exception("corr-alert XREAD failed")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+            continue
+        backoff = 1.0
+        if not result:
+            continue
+        for _stream_name, entries in result:
+            for entry_id, fields in entries:
+                last_id = entry_id
+                if settings.pa_agent_halt:
+                    continue
+                try:
+                    raw = fields.get("data") or fields.get(b"data")
+                    payload = json.loads(raw)
+                    text = alerts.format_correlation_alert(payload)
+                    await alerts.telegram(text)
+                    log.info(
+                        "corr-alert sent: transition=%s max_corr=%s",
+                        payload.get("transition"), payload.get("max_corr"),
+                    )
+                except Exception:
+                    log.exception("corr-alert process failed for %s", entry_id)
+
+
 # ─── Loop 2: daily brief ────────────────────────────────────────────────────
 
 
@@ -111,7 +157,12 @@ async def main() -> None:
     log.info("pa-agent starting (halt=%s)", settings.pa_agent_halt)
     await db.connect()
     try:
-        await asyncio.gather(critical_loop(), brief_loop(), bot_loop())
+        await asyncio.gather(
+            critical_loop(),
+            brief_loop(),
+            bot_loop(),
+            corr_alert_loop(),
+        )
     finally:
         await db.close()
 
