@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # Kill switch
     pa_agent_halt: bool = False
 
+    # Correlation-alert subscriber (Phase 8 v0.2). Reads risk-watcher v0.9
+    # transition events from this redis stream and forwards to Telegram.
+    correlation_alerts_stream: str = "risk:correlation_alerts"
+
     # CommandCenter context — Mac-side personal-life workspace cloned read-only on ai-primary.
     # When set + path exists, brief_loop reads recent memory entries and injects them into
     # the LLM polish prompt so the daily brief reflects Ben's evolving context.
