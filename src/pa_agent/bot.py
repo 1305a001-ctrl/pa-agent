@@ -66,8 +66,14 @@ HELP_TEXT = (
     "/kill-status       show active halts + recent events\n"
     "\n"
     "<b>PA (personal assistant):</b>\n"
-    "/ask     <code>&lt;question&gt;</code> ask the PA — grounded in your CommandCenter\n"
-    "/note    <code>&lt;text&gt;</code> capture a quick note (loaded into next /ask)\n"
+    "/ask     <code>&lt;question&gt;</code> "
+    "ask the PA (CommandCenter + trading state grounded)\n"
+    "/note    <code>&lt;text&gt;</code> "
+    "capture a quick note (loaded into next /ask)\n"
+    "/inbox   <code>&lt;forwarded&gt;</code> "
+    "triage email/WhatsApp content (LLM summary + actions)\n"
+    "/me      what the PA knows about you (context audit)\n"
+    "/reset   clear /ask conversation history\n"
     "\n"
     "<b>Ops:</b>\n"
     "/status   open positions + last pipeline run\n"
@@ -192,12 +198,78 @@ async def _handle(update: dict) -> None:
         else:
             await alerts.telegram("⏳ thinking…")
             try:
+                from pa_agent.db import db as _db
                 from pa_agent.pa import answer_question
-                answer = await answer_question(question)
+                answer = await answer_question(
+                    question, db=_db, redis_client=_r(),
+                )
                 await alerts.telegram(answer)
             except Exception as exc:  # noqa: BLE001
                 log.exception("Manual /ask failed")
                 await alerts.telegram(f"❌ /ask failed: {exc}")
+    elif cmd == "/inbox":
+        # Phase 8 v0.5 — Option C stub: triage forwarded email/WhatsApp/etc
+        # text. LLM produces summary + action items + urgency + category;
+        # full record + raw text saved to _inbox/triage-YYYY-MM-DD.md.
+        raw_text = text[len("/inbox"):].strip()
+        if not raw_text:
+            await alerts.telegram(
+                "Forward content to triage. Example:\n"
+                "  /inbox From: john@acme.com\\nSubject: Q3 budget review\\n...\n"
+                "I'll summarize, extract action items, classify urgency, "
+                "and save to <code>_inbox/triage-YYYY-MM-DD.md</code>."
+            )
+        else:
+            await alerts.telegram("⏳ triaging…")
+            try:
+                from pa_agent.pa import append_triage, triage_inbox_text
+                triage = await triage_inbox_text(raw_text)
+                target = append_triage(settings.commandcenter_path, raw_text, triage)
+                # Build a Telegram-formatted reply
+                summary = triage.get("summary", "(no summary)")
+                urgency = triage.get("urgency", "?")
+                category = triage.get("category", "?")
+                actions = triage.get("action_items", "").strip()
+                urgency_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(
+                    urgency.lower(), "⚪"
+                )
+                reply_lines = [
+                    f"{urgency_emoji} <b>{urgency.upper()}</b> · <code>{category}</code>",
+                    "",
+                    summary,
+                ]
+                if actions:
+                    reply_lines.append("")
+                    reply_lines.append("<b>Actions:</b>")
+                    reply_lines.append(actions)
+                if target:
+                    reply_lines.append("")
+                    reply_lines.append(f"<i>(saved to _inbox/{target.name})</i>")
+                await alerts.telegram("\n".join(reply_lines))
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Manual /inbox failed")
+                await alerts.telegram(f"❌ /inbox failed: {exc}")
+    elif cmd == "/reset":
+        # Phase 8 v0.5 — drop multi-turn history. Useful when starting a
+        # new line of inquiry that shouldn't be shaded by the prior thread.
+        try:
+            from pa_agent.pa import reset_chat_history
+            await reset_chat_history(_r())
+            await alerts.telegram(
+                "🧹 chat history cleared. Next /ask starts fresh."
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Manual /reset failed")
+            await alerts.telegram(f"❌ /reset failed: {exc}")
+    elif cmd == "/me":
+        # Phase 8 v0.4 — what the PA knows about you. Audit + nudge.
+        try:
+            from pa_agent.pa import build_me_summary, load_pa_context
+            ctx = load_pa_context(settings.commandcenter_path)
+            await alerts.telegram(build_me_summary(ctx))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Manual /me failed")
+            await alerts.telegram(f"❌ /me failed: {exc}")
     elif cmd == "/note":
         # Phase 8 v0.4 — append a quick note to today's inbox file.
         # Notes appear in next /ask context immediately.

@@ -35,6 +35,17 @@ async def build_and_send_brief() -> None:
         except Exception:  # noqa: BLE001
             log.exception("Failed to load CommandCenter memory; continuing without")
 
+        # Option B — calendar awareness: today's events from
+        # _inbox/calendar.md surface in the morning brief if Ben maintains
+        # the file. Optional; missing file = empty section.
+        try:
+            from pa_agent.pa import load_calendar_today
+            today_cal = load_calendar_today(settings.commandcenter_path)
+            if today_cal:
+                extra_context += f"\n\nTODAY'S CALENDAR:\n{today_cal}"
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to load calendar; continuing without")
+
     # Run LLM summary on the structured brief if creds present, else send raw
     if settings.litellm_api_key:
         try:
@@ -163,8 +174,9 @@ async def _llm_polish(structured: str, extra_context: str = "") -> str:
         "You're writing a daily brief for the system owner. Below is structured data "
         "from the past 24h. Produce a 4-6 line HTML-formatted Telegram message that "
         "highlights what matters: pipeline health, open positions, any wins/losses, "
-        "and one or two notable signals. Keep it punchy. Preserve Telegram <b> tags. "
-        "No code blocks. Don't invent data not present below.\n\n"
+        "and one or two notable signals. If TODAY'S CALENDAR is in the context, "
+        "surface the next 1-2 events with rough timing. Keep it punchy. Preserve "
+        "Telegram <b> tags. No code blocks. Don't invent data not present below.\n\n"
         f"DATA:\n{structured}{context_block}"
     )
     r = await client.chat.completions.create(
