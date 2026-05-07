@@ -31,6 +31,12 @@ log = logging.getLogger(__name__)
 
 def _setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # Mute httpx/httpcore INFO — they log full request URLs which include
+    # the Telegram bot token in /bot<TOKEN>/getUpdates queries.
+    # Universal default in this stack; learned the hard way 2026-05-04
+    # when FRED key leaked into journald via the same path.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     if settings.sentry_dsn:
         sentry_sdk.init(dsn=settings.sentry_dsn, traces_sample_rate=0.0)
 
