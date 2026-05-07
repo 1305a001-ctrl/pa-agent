@@ -553,10 +553,19 @@ def build_me_summary(context: dict[str, str]) -> str:
     if recent:
         lines.append("")
         lines.append("<b>Most recent memory entry:</b>")
-        first_block = recent.split("\n\n", 1)[0].strip()
-        # Take just the first ~300 chars to keep telegram-friendly
-        snippet = first_block[:300]
-        if len(first_block) > 300:
+        # _load_recent_memory joins entries oldest-first; the LAST entry is
+        # the most recent. Split on `## YYYY-MM-DD` headers to get clean
+        # entry boundaries (bodies often contain `\n\n` paragraphs).
+        entry_starts = list(
+            re.finditer(r"^## \d{4}-\d{2}-\d{2}.*$", recent, re.MULTILINE)
+        )
+        if entry_starts:
+            last_start = entry_starts[-1].start()
+            latest_block = recent[last_start:].strip()
+        else:
+            latest_block = recent
+        snippet = latest_block[:300]
+        if len(latest_block) > 300:
             snippet += "…"
         lines.append(f"<i>{snippet}</i>")
 
