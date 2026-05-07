@@ -38,5 +38,23 @@ class Settings(BaseSettings):
     commandcenter_path: str = "/home/benadmin/commandcenter"
     commandcenter_memory_entries: int = 5
 
+    # Gmail OAuth (Phase 8 v0.6 — Option C2 auto-pull).
+    # Empty = inbox loop dormant; loop kicks in once all three are set.
+    # Setup walkthrough in pa-agent/README.md#gmail-oauth.
+    gmail_oauth_client_id: str = ""
+    gmail_oauth_client_secret: str = ""
+    gmail_oauth_refresh_token: str = ""
+    # Gmail search query — only messages matching this get triaged. Default
+    # pulls unread INBOX items; tighten via env if you want a more curated feed.
+    gmail_query: str = "is:unread in:inbox"
+    # Loop cadence — Gmail API quota is generous (1B/day) so 5 min is fine.
+    # The loop pulls + triages + marks-as-read in one tick.
+    gmail_poll_interval_sec: int = 300
+    # Cap per tick so a flood doesn't spam Telegram. Excess waits for next tick.
+    gmail_max_messages_per_tick: int = 10
+    # When triage urgency >= this level, push the summary to Telegram.
+    # Lower-urgency items just land in _inbox/triage-YYYY-MM-DD.md silently.
+    gmail_telegram_min_urgency: str = "high"  # 'low' | 'medium' | 'high'
+
 
 settings = Settings()
