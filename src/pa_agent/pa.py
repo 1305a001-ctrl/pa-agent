@@ -1,20 +1,24 @@
-"""Personal-assistant Q&A — Phase 8 v0.3 (PA build kickoff).
+"""Personal-assistant Q&A — Phase 8 v0.3+v0.4.
 
 Surfaces an /ask command that takes a free-form question, loads
 CommandCenter context (about-me / about-businesses / voice / recent
-memory), and returns an LLM-grounded answer.
+memory + new: /_inbox/notes-YYYY-MM-DD.md daily quick-notes), and
+returns an LLM-grounded answer.
 
-The PA is meant to be a workplace-collaborator-style helper: it knows
-who Ben is, what his businesses are, what he's been working on
-recently, and how he prefers to be talked to. Trading-specific
-queries already go through /status + /brief; this is for everything else
-(meetings, decisions, recall, drafting).
+v0.4 adds /note — appends a timestamped line to today's
+`_inbox/notes-YYYY-MM-DD.md` so Ben can capture thoughts via Telegram in
+real time. Notes are immediately picked up by load_pa_context() so the
+next /ask sees them. Mac canonical memory.md is untouched (no git push
+from ai-primary) — Ben manually merges notes into memory.md from Mac
+when convenient.
 
-Pure helpers (`load_pa_context`, `build_ask_prompt`) are unit-testable.
-The async `answer_question` composes I/O around them.
+Pure helpers (`load_pa_context`, `build_ask_prompt`, `append_note`,
+`_today_notes_filename`) are unit-testable. The async `answer_question`
+composes I/O around them.
 """
 import logging
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 from openai import AsyncOpenAI
@@ -84,8 +88,88 @@ def _load_recent_memory(path: Path, limit: int = 5) -> str:
     return joined
 
 
+def _today_notes_filename(d: datetime | None = None) -> str:
+    """Pure: return the inbox notes filename for a given date (UTC).
+
+    Format `notes-YYYY-MM-DD.md`. Each day gets its own file so it's
+    easy to merge into memory.md per-day on Mac.
+    """
+    when = d or datetime.now(UTC)
+    return f"notes-{when:%Y-%m-%d}.md"
+
+
+def _load_recent_inbox_notes(path: Path, days: int = 3) -> str:
+    """Read up to `days` most-recent _inbox/notes-*.md files, newest first."""
+    inbox = path / "_inbox"
+    if not inbox.exists() or not inbox.is_dir():
+        return ""
+    files = sorted(inbox.glob("notes-*.md"), reverse=True)[:days]
+    if not files:
+        return ""
+    sections: list[str] = []
+    total = 0
+    for f in files:
+        try:
+            content = f.read_text(encoding="utf-8").strip()
+        except Exception:
+            continue
+        if not content:
+            continue
+        section = f"--- {f.name} ---\n{content}"
+        total += len(section)
+        sections.append(section)
+        if total > _RECENT_MEMORY_CHAR_CAP:
+            break
+    return "\n\n".join(sections)
+
+
+def append_note(path: Path | str | None, text: str) -> Path | None:
+    """Pure-ish: append a timestamped note to today's inbox file.
+
+    Creates the `_inbox/` directory if absent. Returns the absolute path
+    of the file written, or None if path is invalid / write fails.
+
+    Format per line:
+      ## HH:MM:SS UTC
+      <text>
+      \n
+
+    Easy to grep, easy to merge into memory.md by hand.
+    """
+    if not text or not text.strip():
+        return None
+    if path is None:
+        return None
+    path_obj = Path(path) if isinstance(path, str) else path
+    if not path_obj.exists():
+        return None
+    inbox = path_obj / "_inbox"
+    try:
+        inbox.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    target = inbox / _today_notes_filename()
+    now = datetime.now(UTC)
+    block = f"## {now:%H:%M:%S UTC}\n{text.strip()}\n\n"
+    try:
+        # Touch file with header on first write of the day.
+        if not target.exists():
+            header = (
+                f"# Quick notes — {now:%Y-%m-%d}\n\n"
+                "Captured via PA /note. Merge into _system/memory.md "
+                "when convenient.\n\n"
+            )
+            target.write_text(header, encoding="utf-8")
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(block)
+    except Exception:
+        return None
+    return target
+
+
 def load_pa_context(path: Path | str | None) -> dict[str, str]:
-    """Pure: read CommandCenter context files + recent memory into a dict.
+    """Pure: read CommandCenter context files + recent memory + recent
+    inbox notes into a dict.
 
     Returns {label: content} for every section that has non-empty content.
     Missing files produce no entry. Used by build_ask_prompt() and tests.
@@ -107,6 +191,10 @@ def load_pa_context(path: Path | str | None) -> dict[str, str]:
     )
     if recent:
         out["RECENT MEMORY"] = recent
+
+    inbox_notes = _load_recent_inbox_notes(path_obj, days=3)
+    if inbox_notes:
+        out["RECENT QUICK-NOTES"] = inbox_notes
     return out
 
 
@@ -137,6 +225,39 @@ def build_ask_prompt(question: str, context: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+def detect_template_files(path: Path | str | None) -> list[str]:
+    """Pure: identify CommandCenter context files that are still templates.
+
+    A "template" is a file that exists but contains the literal string
+    "TEMPLATE" or "fill in" or has fewer than 200 chars of real content.
+    Returns a list of human-readable filenames the user should fill.
+
+    Used by /ask to nudge the user when their PA grounding is thin.
+    """
+    if path is None:
+        return []
+    path_obj = Path(path) if isinstance(path, str) else path
+    if not path_obj.exists():
+        return []
+    template_markers = ("TEMPLATE", "template — fill", "fill in", "<fill>")
+    out: list[str] = []
+    for label, rel in _CONTEXT_FILES:
+        f = path_obj / rel
+        if not f.exists() or not f.is_file():
+            continue
+        try:
+            content = f.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        # Strip code fences + headers to count actual content
+        meaningful = re.sub(r"^#.*$", "", content, flags=re.M).strip()
+        if any(marker in content for marker in template_markers):
+            out.append(rel)
+        elif len(meaningful) < 200:
+            out.append(rel)
+    return out
+
+
 async def answer_question(question: str) -> str:
     """Compose context + send to LiteLLM. Returns the answer text."""
     if not question.strip():
@@ -159,7 +280,18 @@ async def answer_question(question: str) -> str:
             max_tokens=600,
         )
         answer = (resp.choices[0].message.content or "").strip()
-        return answer or "(empty response from LLM)"
+        if not answer:
+            answer = "(empty response from LLM)"
+
+        # A6: nudge about template files (max once per /ask, low-friction)
+        templates = detect_template_files(settings.commandcenter_path)
+        if templates:
+            answer += (
+                "\n\n<i>(grounding is thin — these context files are still "
+                f"templates: {', '.join(templates)}. Fill them on Mac to "
+                "improve future /ask answers.)</i>"
+            )
+        return answer
     except Exception:
         log.exception("PA /ask failed for q=%r", question[:80])
         return "❌ PA /ask failed — check logs"

@@ -67,6 +67,7 @@ HELP_TEXT = (
     "\n"
     "<b>PA (personal assistant):</b>\n"
     "/ask     <code>&lt;question&gt;</code> ask the PA — grounded in your CommandCenter\n"
+    "/note    <code>&lt;text&gt;</code> capture a quick note (loaded into next /ask)\n"
     "\n"
     "<b>Ops:</b>\n"
     "/status   open positions + last pipeline run\n"
@@ -197,6 +198,35 @@ async def _handle(update: dict) -> None:
             except Exception as exc:  # noqa: BLE001
                 log.exception("Manual /ask failed")
                 await alerts.telegram(f"❌ /ask failed: {exc}")
+    elif cmd == "/note":
+        # Phase 8 v0.4 — append a quick note to today's inbox file.
+        # Notes appear in next /ask context immediately.
+        note_text = text[len("/note"):].strip()
+        if not note_text:
+            await alerts.telegram(
+                "Capture a quick note. Example:\n"
+                "  /note polymarket Hormuz market resolves in 2 days, watch for normalization\n"
+                "Notes go to <code>_inbox/notes-YYYY-MM-DD.md</code> and are loaded "
+                "into the next <code>/ask</code> automatically. Merge into "
+                "<code>_system/memory.md</code> from your Mac when convenient."
+            )
+        else:
+            try:
+                from pa_agent.pa import append_note
+                target = append_note(settings.commandcenter_path, note_text)
+                if target is None:
+                    await alerts.telegram(
+                        "❌ /note failed (commandcenter path not writable). "
+                        "Check pa-agent logs."
+                    )
+                else:
+                    await alerts.telegram(
+                        f"📝 noted to <code>_inbox/{target.name}</code>\n"
+                        f"<i>(visible to next /ask immediately)</i>"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Manual /note failed")
+                await alerts.telegram(f"❌ /note failed: {exc}")
     elif cmd == "/status":
         await alerts.telegram(await _status_text())
     elif cmd == "/brief":
