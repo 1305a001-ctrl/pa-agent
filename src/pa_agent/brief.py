@@ -20,8 +20,16 @@ async def build_and_send_brief() -> None:
     trades = await db.trades_since(cutoff)
     positions = await db.poly_positions_since(cutoff)
     runs = await db.pipeline_runs_since(cutoff)
+    # R3: research check-in. signal_outcomes is populated by outcome-scorer
+    # daily; if the table is empty/missing, the helper returns 0 counts and
+    # the brief just doesn't show the research section.
+    try:
+        outcomes = await db.signal_outcomes_since(cutoff)
+    except Exception:
+        log.exception("brief: signal_outcomes_since failed; skipping research section")
+        outcomes = []
 
-    text = _format_brief(signals, trades, positions, runs)
+    text = _format_brief(signals, trades, positions, runs, outcomes)
 
     # Optionally enrich with recent CommandCenter memory entries so the LLM polish
     # has Ben's evolving context (corrections, decisions, learnings).
@@ -84,7 +92,71 @@ def _load_commandcenter_memory(path: Path, limit: int = 5) -> str:
     return "\n\n".join(entries[-limit:])
 
 
-def _format_brief(signals, trades, positions, runs) -> str:
+def _format_research_summary(outcomes) -> list[str]:
+    """Pure: aggregate signal_outcomes rows into a research check-in block.
+
+    Returns a list of HTML lines to append to the brief, or [] if no outcomes.
+
+    Surfaces:
+      - total scored + win/loss/flat split
+      - hit rate (decisive only — flats excluded)
+      - top 3 strategies by hit rate (min 5 outcomes for stat significance)
+      - top 3 strategies by total scored count (volume leaders)
+    """
+    if not outcomes:
+        return []
+
+    by_outcome: dict[str, int] = {}
+    by_strategy: dict[str, dict[str, int | str]] = {}
+    for o in outcomes:
+        outcome = o["outcome"]
+        by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
+        slug = o.get("strategy_slug") or "<unknown>"
+        s = by_strategy.setdefault(slug, {"total": 0, "wins": 0, "losses": 0, "flats": 0})
+        s["total"] = int(s["total"]) + 1  # type: ignore[operator]
+        if outcome == "win":
+            s["wins"] = int(s["wins"]) + 1  # type: ignore[operator]
+        elif outcome == "loss":
+            s["losses"] = int(s["losses"]) + 1  # type: ignore[operator]
+        elif outcome == "flat":
+            s["flats"] = int(s["flats"]) + 1  # type: ignore[operator]
+
+    total = sum(by_outcome.values())
+    wins = by_outcome.get("win", 0)
+    losses = by_outcome.get("loss", 0)
+    flats = by_outcome.get("flat", 0)
+    expired = by_outcome.get("expired", 0)
+    decisive = wins + losses
+    hit_rate = (wins / decisive) if decisive > 0 else 0.0
+
+    lines = [
+        "",
+        f"<b>Research</b>: {total} signals scored",
+        f"  win {wins} · loss {losses} · flat {flats} · expired {expired}"
+        f" · hit rate {hit_rate:.0%}",
+    ]
+
+    # Top strategies by hit rate (need ≥5 outcomes to count, else stats are noise).
+    candidates = [
+        (slug, int(s["wins"]), int(s["wins"]) + int(s["losses"]), int(s["total"]))
+        for slug, s in by_strategy.items()
+        if int(s["wins"]) + int(s["losses"]) >= 5
+    ]
+    if candidates:
+        ranked = sorted(
+            candidates,
+            key=lambda x: (x[1] / x[2] if x[2] > 0 else 0, x[1]),  # win-rate then wins
+            reverse=True,
+        )[:3]
+        lines.append("  top strategies (≥5 decisive):")
+        for slug, w, dec, tot in ranked:
+            rate = w / dec if dec > 0 else 0
+            lines.append(f"    • {slug}: {rate:.0%} ({w}/{dec}, {tot} total)")
+
+    return lines
+
+
+def _format_brief(signals, trades, positions, runs, outcomes=None) -> str:
     """Plain-text brief; the LLM optionally rewrites this into a tighter version."""
     sigs_by_dir = {"long": 0, "short": 0, "neutral": 0, "watch": 0}
     sigs_by_asset: dict[str, int] = {}
@@ -143,6 +215,12 @@ def _format_brief(signals, trades, positions, runs) -> str:
                 f"  • {s['asset']} {s['direction']} conf {s['confidence']:.2f}"
                 f" — {((s['payload'] or {}).get('reasoning') or '')[:80]}"
             )
+
+    # R3 — research check-in. Appended last so the LLM polish has full
+    # context (which strategies are actually winning informs which signals
+    # to highlight).
+    if outcomes:
+        out.extend(_format_research_summary(outcomes))
 
     return "\n".join(out)
 
