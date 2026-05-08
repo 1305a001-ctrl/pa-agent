@@ -37,6 +37,20 @@ class Settings(BaseSettings):
     # and forwards each to Telegram with the booked PnL.
     poly_settlement_alerts_stream: str = "poly:settlement_alerts"
 
+    # Alpha fire alerts (Phase 8 v0.8). Subscribes to alphas:active stream,
+    # filters by strategy_slug, sends one Telegram message per fire.
+    # Default-enabled because operator visibility is high-value with no
+    # cost (the strategies fire infrequently; Telegram noise is bounded).
+    alpha_alerts_enabled: bool = True
+    alphas_stream: str = "alphas:active"
+    # CSV of strategy slugs to alert on. Default tracks the active poly
+    # strategies from the 2026-05-09 build. Empty = all strategies (noisy).
+    alpha_alert_strategies: str = (
+        "poly-fade-extreme,poly-liq-cascade-taker-daily,"
+        "poly-fade-daily,poly-liq-cascade-taker,poly-sell-wings,"
+        "poly-news-taker"
+    )
+
     # CommandCenter context — Mac-side personal-life workspace cloned read-only on ai-primary.
     # When set + path exists, brief_loop reads recent memory entries and injects them into
     # the LLM polish prompt so the daily brief reflects Ben's evolving context.

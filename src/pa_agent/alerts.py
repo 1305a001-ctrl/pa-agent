@@ -117,6 +117,61 @@ def format_poly_settlement(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def format_alpha_fire(alpha: dict) -> str:
+    """Pure: Polymarket alpha emission (from alphas:active) → Telegram HTML.
+
+    Tracks per-strategy fires so Ben sees real-time activity from
+    poly-fade-extreme / poly-liq-cascade-taker-daily / etc. without
+    SSH-grepping the strategy-runners logs.
+    """
+    metadata = alpha.get("metadata") or {}
+    direction = alpha.get("direction") or "?"
+    confidence = float(alpha.get("confidence") or 0.0)
+    strategy_slug = metadata.get("strategy_slug", "?")
+    asset = metadata.get("asset") or alpha.get("asset", "?")
+    cadence = metadata.get("cadence", "")
+    edge_pp = metadata.get("edge_pp")
+    edge_bps = alpha.get("edge_bps")
+    yes_price = metadata.get("yes_price")
+    cascade_total = metadata.get("cascade_total_usd")
+    perp_return = metadata.get("perp_return") or metadata.get("perp_return_5m")
+
+    direction_emoji = {"long": "📈", "short": "📉"}.get(direction, "•")
+    side_label = (
+        "buy YES" if direction == "long"
+        else "buy NO" if direction == "short"
+        else direction
+    )
+
+    # Strategy-specific context line — present only the fields each strategy
+    # emits, so messages stay short and informative.
+    context_lines: list[str] = []
+    if yes_price is not None and perp_return is not None:
+        # Fade-extreme / fade-daily — extreme + perp non-confirmation
+        context_lines.append(
+            f"YES <b>{float(yes_price):.3f}</b> · perp {float(perp_return):+.4f}"
+        )
+    elif cascade_total:
+        # Liq-cascade-taker — triggered by liq cascade
+        context_lines.append(
+            f"liq cascade <b>${float(cascade_total):,.0f}</b> on "
+            f"{metadata.get('trigger_strategy_slug', '?')}"
+        )
+    if edge_pp is not None:
+        context_lines.append(f"edge <b>{float(edge_pp):.3f}pp</b>")
+    elif edge_bps is not None:
+        context_lines.append(f"edge <b>{int(edge_bps)} bps</b>")
+
+    lines = [
+        f"<b>{direction_emoji} {strategy_slug}</b> · {asset}{' '+cadence if cadence else ''}",
+        f"<code>{alpha.get('asset', '?')}</code>",
+        f"{side_label} · confidence <b>{confidence:.2f}</b>",
+    ]
+    if context_lines:
+        lines.append(" · ".join(context_lines))
+    return "\n".join(lines)
+
+
 def format_critical(s: Signal) -> str:
     """Rich format for a signals:critical message."""
     direction_emoji = {"long": "📈", "short": "📉", "neutral": "➖", "watch": "👀"}.get(
