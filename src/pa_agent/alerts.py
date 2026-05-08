@@ -73,6 +73,50 @@ def format_correlation_alert(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def format_poly_settlement(payload: dict) -> str:
+    """Pure: structured settlement event (from poly:settlement_alerts) →
+    Telegram HTML.
+
+    Payload shape (set by poly-adapter v0.2 settlement.py):
+      {
+        "event": "poly_position_settled",
+        "position_id": "<uuid>",
+        "slug": "bitcoin-up-or-down-on-may-6-2026",
+        "side": "long" | "short",
+        "qty": 4028.0,
+        "entry_price": 0.50,
+        "final_yes_price": 1.0,
+        "yes_won": true | false,
+        "realized_pnl_usd": 2014.0,
+        "reason": "closed_yes" | "past_end_yes_decisive" | …,
+        "settled_at": "2026-05-08T…",
+      }
+    """
+    pnl = payload.get("realized_pnl_usd") or 0.0
+    yes_won = payload.get("yes_won")
+    side = payload.get("side", "?")
+    slug = payload.get("slug", "?")
+    qty = payload.get("qty") or 0.0
+    entry = payload.get("entry_price") or 0.0
+    final_yes = payload.get("final_yes_price") or 0.0
+    reason = payload.get("reason", "?")
+
+    win = pnl > 0
+    icon = "🟢" if win else ("🔴" if pnl < 0 else "⚪")
+    outcome = "YES won" if yes_won else "NO won" if yes_won is False else "?"
+
+    sign = "+" if pnl > 0 else ("-" if pnl < 0 else "")
+    pnl_abs_fmt = f"{abs(pnl):,.2f}"
+    lines = [
+        f"<b>{icon} Poly settled — {outcome}</b>",
+        f"<code>{slug}</code>",
+        f"{side} qty <b>{qty:.2f}</b> · entry {entry:.4f} → final {final_yes:.4f}",
+        f"realized PnL: <b>{sign}${pnl_abs_fmt}</b>",
+        f"<i>via {reason}</i>",
+    ]
+    return "\n".join(lines)
+
+
 def format_critical(s: Signal) -> str:
     """Rich format for a signals:critical message."""
     direction_emoji = {"long": "📈", "short": "📉", "neutral": "➖", "watch": "👀"}.get(
