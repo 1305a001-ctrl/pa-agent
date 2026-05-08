@@ -124,6 +124,75 @@ async def corr_alert_loop() -> None:
                     log.exception("corr-alert process failed for %s", entry_id)
 
 
+# ─── Loop 7: alpha fire alerts (Phase 8 v0.8) ─────────────────────────────
+
+
+async def alpha_alert_loop() -> None:
+    """XREAD alphas:active from $ (latest); for each emission whose
+    metadata.strategy_slug is in the configured allowlist, format and
+    send to Telegram. Operator visibility into per-strategy fires
+    without SSH-grepping the strategy-runners logs.
+
+    Default-enabled. Disable via ALPHA_ALERTS_ENABLED=false if too noisy.
+    """
+    if not settings.alpha_alerts_enabled:
+        log.info("alpha-alert loop: disabled via setting")
+        return
+    allowed = {s.strip() for s in (settings.alpha_alert_strategies or "").split(",") if s.strip()}
+    if not allowed:
+        log.info("alpha-alert loop: empty allowlist; exiting")
+        return
+
+    r = aioredis.from_url(settings.redis_url, decode_responses=True)
+    last_id = "$"
+    backoff = 1.0
+    log.info(
+        "alpha-alert loop starting; subscribing to %s allowlist=%s",
+        settings.alphas_stream, sorted(allowed),
+    )
+    while True:
+        try:
+            result = await r.xread(
+                {settings.alphas_stream: last_id},
+                block=10_000,
+                count=20,
+            )
+        except Exception:
+            log.exception("alpha-alert XREAD failed")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+            continue
+        backoff = 1.0
+        if not result:
+            continue
+        for _stream_name, entries in result:
+            for entry_id, fields in entries:
+                last_id = entry_id
+                if settings.pa_agent_halt:
+                    continue
+                try:
+                    raw = fields.get("data") or fields.get(b"data")
+                    alpha = json.loads(raw)
+                except Exception:
+                    log.warning("alpha-alert: bad payload at %s", entry_id)
+                    continue
+                metadata = alpha.get("metadata") or {}
+                strategy_slug = metadata.get("strategy_slug") or alpha.get("strategy_slug") or ""
+                if strategy_slug not in allowed:
+                    continue
+                try:
+                    text = alerts.format_alpha_fire(alpha)
+                    await alerts.telegram(text)
+                    log.info(
+                        "alpha-alert sent: strategy=%s direction=%s asset=%s",
+                        strategy_slug,
+                        alpha.get("direction"),
+                        alpha.get("asset"),
+                    )
+                except Exception:
+                    log.exception("alpha-alert process failed for %s", entry_id)
+
+
 # ─── Loop 6: poly settlement alerts (Phase 8 v0.7) ─────────────────────────
 
 
@@ -225,6 +294,7 @@ async def main() -> None:
             corr_alert_loop(),
             inbox_pull_loop(),
             poly_settle_loop(),
+            alpha_alert_loop(),
         )
     finally:
         await db.close()
