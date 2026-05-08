@@ -82,6 +82,33 @@ class DB:
             cutoff,
         )
 
+    # ─── Research check-in (Phase 8 v0.7 — R3) ──────────────────────────
+
+    async def signal_outcomes_since(self, cutoff: datetime) -> list[asyncpg.Record]:
+        """Aggregate signal outcomes for the daily research summary.
+
+        Joins to market_signals + strategies to surface which strategies are
+        actually winning. Only counts each (signal, horizon) once via DISTINCT
+        — outcome-scorer can re-score, and we don't want to double-count.
+        """
+        return await self.pool.fetch(
+            """
+            SELECT
+              o.outcome,
+              o.evaluation_horizon,
+              o.price_change_pct,
+              s.strategy_id,
+              st.slug                            AS strategy_slug,
+              st.frontmatter->>'bucket'          AS bucket
+            FROM signal_outcomes o
+            JOIN market_signals s   ON s.id = o.signal_id
+            LEFT JOIN strategies st ON st.id = s.strategy_id
+            WHERE o.evaluated_at >= $1
+            ORDER BY o.evaluated_at DESC
+            """,
+            cutoff,
+        )
+
 
 async def _init_connection(conn: asyncpg.Connection) -> None:
     await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
