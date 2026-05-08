@@ -1,6 +1,6 @@
-"""pa-agent daemon — Phase 8 v0.6.
+"""pa-agent daemon — Phase 8 v0.7.
 
-Five concurrent loops:
+Six concurrent loops:
   1. critical_loop      — subscribes to signals:critical, sends rich Telegram alerts
   2. brief_loop         — fires once per day at BRIEF_LOCAL_HOUR
   3. bot_loop           — long-poll Telegram getUpdates for /ask /note /inbox /me /reset
@@ -8,9 +8,10 @@ Five concurrent loops:
                           risk-watcher v0.9), formats + sends Telegram brief on
                           cluster_forming / cluster_resolved.
   5. inbox_pull_loop    — Gmail OAuth auto-pull (Phase 8 v0.6, dormant until creds
-                          provisioned). Triages new email + archives to
-                          _inbox/triage-YYYY-MM-DD.md, pushes high-urgency to
-                          Telegram.
+                          provisioned). Triages new email + archives.
+  6. poly_settle_loop   — XREADs poly:settlement_alerts (auto-close events from
+                          poly-adapter v0.2). Pushes booked PnL to Telegram so
+                          Ben sees outcomes in real-time without checking the UI.
 """
 import asyncio
 import json
@@ -123,6 +124,56 @@ async def corr_alert_loop() -> None:
                     log.exception("corr-alert process failed for %s", entry_id)
 
 
+# ─── Loop 6: poly settlement alerts (Phase 8 v0.7) ─────────────────────────
+
+
+async def poly_settle_loop() -> None:
+    """XREAD poly:settlement_alerts from $ (latest) and forward each
+    settlement event to Telegram. Same shape as corr_alert_loop —
+    XREAD blocks 10s, exponential-backoff on redis hiccups, halt-aware.
+    """
+    r = aioredis.from_url(settings.redis_url, decode_responses=True)
+    last_id = "$"
+    backoff = 1.0
+    log.info(
+        "poly-settle loop starting; subscribing to %s",
+        settings.poly_settlement_alerts_stream,
+    )
+    while True:
+        try:
+            result = await r.xread(
+                {settings.poly_settlement_alerts_stream: last_id},
+                block=10_000,
+                count=10,
+            )
+        except Exception:
+            log.exception("poly-settle XREAD failed")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+            continue
+        backoff = 1.0
+        if not result:
+            continue
+        for _stream_name, entries in result:
+            for entry_id, fields in entries:
+                last_id = entry_id
+                if settings.pa_agent_halt:
+                    continue
+                try:
+                    raw = fields.get("data") or fields.get(b"data")
+                    payload = json.loads(raw)
+                    text = alerts.format_poly_settlement(payload)
+                    await alerts.telegram(text)
+                    log.info(
+                        "poly-settle sent: slug=%s pnl=%s yes_won=%s",
+                        payload.get("slug"),
+                        payload.get("realized_pnl_usd"),
+                        payload.get("yes_won"),
+                    )
+                except Exception:
+                    log.exception("poly-settle process failed for %s", entry_id)
+
+
 # ─── Loop 2: daily brief ────────────────────────────────────────────────────
 
 
@@ -173,6 +224,7 @@ async def main() -> None:
             bot_loop(),
             corr_alert_loop(),
             inbox_pull_loop(),
+            poly_settle_loop(),
         )
     finally:
         await db.close()

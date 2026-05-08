@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     # transition events from this redis stream and forwards to Telegram.
     correlation_alerts_stream: str = "risk:correlation_alerts"
 
+    # Poly settlement-alert subscriber (Phase 8 v0.7). Reads poly-adapter
+    # v0.2 settlement events (one XADD per auto-closed resolved market)
+    # and forwards each to Telegram with the booked PnL.
+    poly_settlement_alerts_stream: str = "poly:settlement_alerts"
+
     # CommandCenter context — Mac-side personal-life workspace cloned read-only on ai-primary.
     # When set + path exists, brief_loop reads recent memory entries and injects them into
     # the LLM polish prompt so the daily brief reflects Ben's evolving context.
