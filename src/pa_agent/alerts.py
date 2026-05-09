@@ -117,6 +117,67 @@ def format_poly_settlement(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def format_eod_digest(rows: list[dict]) -> str:
+    """Pure: per-strategy paper PnL digest for end-of-day Telegram.
+
+    `rows` are dict-shaped records with: slug, status, realized_pnl_usd,
+    unrealized_pnl_usd, opened_at, closed_at. Aggregates per strategy →
+    closed n / realized + open n / unrealized.
+
+    Output is HTML, sorted by total absolute PnL desc.
+    """
+    if not rows:
+        return "<b>📊 EOD Digest</b>\n<i>No positions opened in the last 24h.</i>"
+
+    # Aggregate per slug
+    agg: dict[str, dict[str, float]] = {}
+    for r in rows:
+        slug = r.get("slug") or "?"
+        rec = agg.setdefault(slug, {
+            "n_closed": 0, "n_open": 0, "realized": 0.0, "unrealized": 0.0,
+        })
+        if r.get("status") == "closed":
+            rec["n_closed"] += 1
+            rpnl = r.get("realized_pnl_usd")
+            if rpnl is not None:
+                rec["realized"] += float(rpnl)
+        else:
+            rec["n_open"] += 1
+            upnl = r.get("unrealized_pnl_usd")
+            if upnl is not None:
+                rec["unrealized"] += float(upnl)
+
+    # Sort by absolute total
+    items = sorted(
+        agg.items(),
+        key=lambda kv: abs(kv[1]["realized"]) + abs(kv[1]["unrealized"]),
+        reverse=True,
+    )
+
+    lines = ["<b>📊 EOD Digest — last 24h paper trades</b>", ""]
+    total_realized = 0.0
+    total_unrealized = 0.0
+    for slug, rec in items:
+        rsign = "+" if rec["realized"] >= 0 else "-"
+        usign = "+" if rec["unrealized"] >= 0 else "-"
+        lines.append(
+            f"<code>{slug:<32}</code> "
+            f"closed <b>{int(rec['n_closed'])}</b> {rsign}${abs(rec['realized']):,.2f} · "
+            f"open <b>{int(rec['n_open'])}</b> {usign}${abs(rec['unrealized']):,.2f}"
+        )
+        total_realized += rec["realized"]
+        total_unrealized += rec["unrealized"]
+
+    lines.append("")
+    sign_r = "+" if total_realized >= 0 else "-"
+    sign_u = "+" if total_unrealized >= 0 else "-"
+    lines.append(
+        f"<b>Total realized:</b> {sign_r}${abs(total_realized):,.2f}  "
+        f"<b>unrealized:</b> {sign_u}${abs(total_unrealized):,.2f}"
+    )
+    return "\n".join(lines)
+
+
 def format_alpha_fire(alpha: dict) -> str:
     """Pure: Polymarket alpha emission (from alphas:active) → Telegram HTML.
 

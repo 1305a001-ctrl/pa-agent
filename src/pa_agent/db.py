@@ -84,6 +84,52 @@ class DB:
 
     # ─── Research check-in (Phase 8 v0.7 — R3) ──────────────────────────
 
+    async def per_strategy_pnl_since(self, cutoff: datetime) -> list[asyncpg.Record]:
+        """Per-strategy realized PnL on closed positions since cutoff.
+
+        Used by:
+          - EOD daily digest (formatted into Telegram per-strategy summary)
+          - auto-disable monitor (drawdown + consecutive-loss detection)
+
+        Joins positions → strategies; counts open + closed separately. Only
+        counts realized pnl on closed positions (open unrealized swings can
+        flip wildly with mark-to-mid).
+        """
+        return await self.pool.fetch(
+            """
+            SELECT
+              s.slug,
+              p.status,
+              p.realized_pnl_usd,
+              p.unrealized_pnl_usd,
+              p.opened_at,
+              p.closed_at
+            FROM positions p
+            JOIN strategies s ON s.id = p.strategy_id
+            WHERE p.opened_at >= $1
+            ORDER BY p.opened_at DESC
+            """,
+            cutoff,
+        )
+
+    async def recent_closed_per_strategy(
+        self, slug: str, *, limit: int = 10,
+    ) -> list[asyncpg.Record]:
+        """Last N closed positions for one strategy, newest first.
+        Used by auto-disable to count consecutive losses."""
+        return await self.pool.fetch(
+            """
+            SELECT p.realized_pnl_usd, p.closed_at, p.asset
+            FROM positions p
+            JOIN strategies s ON s.id = p.strategy_id
+            WHERE s.slug = $1 AND p.status = 'closed'
+              AND p.realized_pnl_usd IS NOT NULL
+            ORDER BY p.closed_at DESC
+            LIMIT $2
+            """,
+            slug, limit,
+        )
+
     async def signal_outcomes_since(self, cutoff: datetime) -> list[asyncpg.Record]:
         """Aggregate signal outcomes for the daily research summary.
 
