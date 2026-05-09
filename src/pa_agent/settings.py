@@ -44,11 +44,41 @@ class Settings(BaseSettings):
     alpha_alerts_enabled: bool = True
     alphas_stream: str = "alphas:active"
     # CSV of strategy slugs to alert on. Default tracks the active poly
-    # strategies from the 2026-05-09 build. Empty = all strategies (noisy).
+    # strategies. Empty = all strategies (noisy).
     alpha_alert_strategies: str = (
         "poly-fade-extreme,poly-liq-cascade-taker-daily,"
         "poly-fade-daily,poly-liq-cascade-taker,poly-sell-wings,"
-        "poly-news-taker"
+        "poly-news-taker,poly-news-thesis-taker,"
+        "poly-resolution-momentum,poly-momentum-slow,"
+        "poly-crypto-momentum-slow,poly-politics-momentum-slow,"
+        "poly-macro-momentum-slow"
+    )
+
+    # EOD daily digest (Phase 8 v0.9). Posts a per-strategy paper PnL
+    # summary to Telegram at brief_local_hour - useful operator habit.
+    eod_digest_enabled: bool = True
+    # Strategies to include in the digest (CSV). Empty = all strategies
+    # that have positions in the lookback window.
+    eod_digest_strategies: str = ""
+
+    # Auto-disable monitor (Phase 8 v0.9). Watches per-strategy realized
+    # PnL on closed positions; halts when consecutive losses or 24h
+    # drawdown breaches the threshold. Adds halted slug to Redis set
+    # `strategy:halts` and sends a Telegram alert. Operator can manually
+    # SREM to un-halt or flip frontmatter to inactive permanently.
+    auto_disable_enabled: bool = True
+    auto_disable_check_interval_sec: int = 300  # 5 min
+    auto_disable_consecutive_loss_threshold: int = 5
+    auto_disable_realized_24h_threshold: float = -100.0  # halts when 24h ≤ -$100
+    auto_disable_redis_halt_set: str = "strategy:halts"
+    # Strategies to monitor (CSV). Empty defaults to known poly strategies.
+    auto_disable_strategies: str = (
+        "poly-fade-extreme,poly-liq-cascade-taker-daily,"
+        "poly-fade-daily,poly-liq-cascade-taker,poly-sell-wings,"
+        "poly-news-taker,poly-news-thesis-taker,"
+        "poly-resolution-momentum,"
+        "poly-crypto-momentum,poly-crypto-momentum-slow,"
+        "poly-politics-momentum-slow,poly-macro-momentum-slow"
     )
 
     # CommandCenter context — Mac-side personal-life workspace cloned read-only on ai-primary.

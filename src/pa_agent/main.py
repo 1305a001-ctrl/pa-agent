@@ -127,6 +127,136 @@ async def corr_alert_loop() -> None:
 # ─── Loop 7: alpha fire alerts (Phase 8 v0.8) ─────────────────────────────
 
 
+async def eod_digest_loop() -> None:
+    """Once-per-day Telegram with per-strategy paper PnL across last 24h.
+
+    Fires at brief_local_hour:brief_local_minute alongside the daily brief
+    (effectively rides the same schedule). Reads `positions` table via DB
+    pool; aggregates by strategy slug; formats via alerts.format_eod_digest.
+    """
+    if not settings.eod_digest_enabled:
+        log.info("eod-digest loop: disabled via setting")
+        return
+
+    log.info(
+        "eod-digest loop starting; will fire at %02d:%02d %s daily",
+        settings.brief_local_hour, settings.brief_local_minute, settings.brief_timezone,
+    )
+    while True:
+        target = _next_brief_at()
+        now = datetime.now(UTC)
+        delay = max(1.0, (target - now).total_seconds())
+        await asyncio.sleep(delay)
+        if settings.pa_agent_halt:
+            log.info("eod-digest skipped — pa_agent_halt=1")
+            continue
+        try:
+            cutoff = datetime.now(UTC) - timedelta(hours=24)
+            rows = await db.per_strategy_pnl_since(cutoff)
+            row_dicts = [
+                {
+                    "slug": r["slug"], "status": r["status"],
+                    "realized_pnl_usd": r["realized_pnl_usd"],
+                    "unrealized_pnl_usd": r["unrealized_pnl_usd"],
+                    "opened_at": r["opened_at"], "closed_at": r["closed_at"],
+                }
+                for r in rows
+            ]
+            text = alerts.format_eod_digest(row_dicts)
+            await alerts.telegram(text)
+            log.info("eod-digest sent: %d position rows", len(row_dicts))
+        except Exception:
+            log.exception("eod-digest failed")
+
+
+# ─── Loop 9: auto-disable monitor (Phase 8 v0.9) ──────────────────────────
+
+
+async def auto_disable_loop() -> None:
+    """Periodically evaluates each tracked strategy's recent closed PnL;
+    halts strategies whose consecutive losses or 24h drawdown exceed
+    thresholds. Halt = SADD to Redis set + Telegram alert.
+
+    The Redis set `strategy:halts` is the source of truth — alpha-fusion
+    can read it to drop alphas from halted strategies (follow-up).
+    For now, the alert lets the operator manually flip frontmatter to
+    `inactive` if they agree with the call.
+    """
+    if not settings.auto_disable_enabled:
+        log.info("auto-disable loop: disabled via setting")
+        return
+    from pa_agent import auto_disable
+
+    strategies_to_watch = [
+        s.strip() for s in settings.auto_disable_strategies.split(",") if s.strip()
+    ]
+    if not strategies_to_watch:
+        log.info("auto-disable loop: no strategies configured; exiting")
+        return
+
+    r = aioredis.from_url(settings.redis_url, decode_responses=True)
+    log.info(
+        "auto-disable loop starting; watching %d strategies, "
+        "consec-loss-threshold=%d, 24h-pnl-threshold=$%.2f",
+        len(strategies_to_watch),
+        settings.auto_disable_consecutive_loss_threshold,
+        settings.auto_disable_realized_24h_threshold,
+    )
+
+    while True:
+        try:
+            # Skip strategies already halted (no double-alerts)
+            halted = await r.smembers(settings.auto_disable_redis_halt_set)
+            halted_set = set(halted) if halted else set()
+            now = auto_disable.now_utc()
+
+            for slug in strategies_to_watch:
+                if slug in halted_set:
+                    continue
+                if settings.pa_agent_halt:
+                    continue
+                try:
+                    closed = await db.recent_closed_per_strategy(
+                        slug, limit=settings.auto_disable_consecutive_loss_threshold,
+                    )
+                    pnl_24h_records = await db.recent_closed_per_strategy(slug, limit=200)
+                except Exception:
+                    log.exception("auto-disable.db_query_failed slug=%s", slug)
+                    continue
+
+                recent_pnls = [
+                    float(r["realized_pnl_usd"]) for r in closed
+                    if r.get("realized_pnl_usd") is not None
+                ]
+                pnls_24h = auto_disable.parse_pnls_for_24h(
+                    [dict(r) for r in pnl_24h_records], now=now,
+                )
+                decision = auto_disable.evaluate_strategy_halt(
+                    recent_closed_pnls=recent_pnls,
+                    pnls_24h=pnls_24h,
+                    consecutive_loss_threshold=settings.auto_disable_consecutive_loss_threshold,
+                    realized_24h_threshold=settings.auto_disable_realized_24h_threshold,
+                )
+                if decision.should_halt:
+                    try:
+                        await r.sadd(settings.auto_disable_redis_halt_set, slug)
+                        await alerts.telegram(
+                            auto_disable.format_halt_alert(slug, decision)
+                        )
+                        log.warning(
+                            "auto-disable: HALTED slug=%s reason=%s",
+                            slug, decision.reason,
+                        )
+                    except Exception:
+                        log.exception("auto-disable.halt_publish_failed slug=%s", slug)
+        except Exception:
+            log.exception("auto-disable cycle failed")
+        await asyncio.sleep(settings.auto_disable_check_interval_sec)
+
+
+# ─── Loop 7: alpha fire alerts (Phase 8 v0.8) ─────────────────────────────
+
+
 async def alpha_alert_loop() -> None:
     """XREAD alphas:active from $ (latest); for each emission whose
     metadata.strategy_slug is in the configured allowlist, format and
@@ -295,6 +425,8 @@ async def main() -> None:
             inbox_pull_loop(),
             poly_settle_loop(),
             alpha_alert_loop(),
+            eod_digest_loop(),
+            auto_disable_loop(),
         )
     finally:
         await db.close()
