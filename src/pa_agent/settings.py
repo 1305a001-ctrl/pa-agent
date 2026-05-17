@@ -81,6 +81,25 @@ class Settings(BaseSettings):
         "poly-politics-momentum-slow,poly-macro-momentum-slow"
     )
 
+    # Cap-breach subscriber (Phase 8 v0.11). Reads the oms-gateway
+    # `risk:cap_breaches` stream and forwards a Telegram alert per breach.
+    # Rate-limited per (reason, cluster) tuple so a runaway pulse doesn't
+    # spam — first breach in a window pings, rest are absorbed silently.
+    cap_breach_alerts_enabled: bool = True
+    cap_breach_alerts_stream: str = "risk:cap_breaches"
+    cap_breach_alert_rate_limit_sec: int = 1800  # 30 min per (reason, key)
+
+    # Position-aging monitor (Phase 8 v0.10). Periodically scans open
+    # positions; sends one Telegram alert per (position, age-tier) crossing
+    # so the operator sees stale opens without re-alerts every cycle.
+    # Polymarket positions are skipped (resolution-bound by design).
+    position_aging_enabled: bool = True
+    position_aging_check_interval_sec: int = 1800  # 30 min
+    # Sent-alert keys live in this Redis set with a TTL so stale entries
+    # don't accumulate forever after a position closes.
+    position_aging_redis_set: str = "position:aging_alerts_sent"
+    position_aging_alert_ttl_sec: int = 60 * 60 * 24 * 30  # 30 days
+
     # CommandCenter context — Mac-side personal-life workspace cloned read-only on ai-primary.
     # When set + path exists, brief_loop reads recent memory entries and injects them into
     # the LLM polish prompt so the daily brief reflects Ben's evolving context.

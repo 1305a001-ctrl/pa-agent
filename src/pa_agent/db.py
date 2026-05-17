@@ -112,6 +112,32 @@ class DB:
             cutoff,
         )
 
+    async def open_positions_for_aging(self) -> list[asyncpg.Record]:
+        """Open positions joined to strategies, with bucket from frontmatter.
+
+        Used by position_aging_loop. Ordered oldest-first so the operator
+        sees the most-stale positions in the alert summary.
+        """
+        return await self.pool.fetch(
+            """
+            SELECT
+              p.id            AS position_id,
+              p.asset,
+              p.venue,
+              p.opened_at,
+              p.qty,
+              p.mark_price,
+              p.avg_entry_price,
+              p.unrealized_pnl_usd,
+              s.slug,
+              s.frontmatter->>'bucket' AS bucket
+            FROM positions p
+            JOIN strategies s ON s.id = p.strategy_id
+            WHERE p.status = 'open' AND p.qty > 0
+            ORDER BY p.opened_at ASC
+            """
+        )
+
     async def recent_closed_per_strategy(
         self, slug: str, *, limit: int = 10,
     ) -> list[asyncpg.Record]:

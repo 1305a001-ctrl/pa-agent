@@ -233,6 +233,49 @@ def format_alpha_fire(alpha: dict) -> str:
     return "\n".join(lines)
 
 
+def format_cap_breach(payload: dict) -> str:
+    """Pure: oms-gateway cap-breach event → Telegram HTML.
+
+    Payload shape (from oms_gateway/router.py):
+      {
+        "ts": "2026-05-09T...",
+        "reason": "bucket_exposure_cap_exceeded" | "cluster_exposure_cap_exceeded",
+        "strategy_slug": "...",
+        "asset": "...",
+        "venue": "...",
+        "bucket": "...",
+        "cluster": "...",
+        "snapshot": {"cap_usd": ..., "current_exposure_usd": ...,
+                     "would_be_exposure_usd": ..., "proposed_notional_usd": ...},
+        "alpha_id": "...",
+      }
+    """
+    reason = payload.get("reason", "?")
+    snapshot = payload.get("snapshot") or {}
+    cap = snapshot.get("cap_usd") or 0.0
+    current = snapshot.get("current_exposure_usd") or 0.0
+    would_be = snapshot.get("would_be_exposure_usd") or 0.0
+    proposed = snapshot.get("proposed_notional_usd") or 0.0
+
+    is_cluster = reason == "cluster_exposure_cap_exceeded"
+    headline = "🚧 Cluster cap" if is_cluster else "🚧 Bucket cap"
+    key_label = (
+        f"cluster <code>{payload.get('cluster', '?')}</code>"
+        if is_cluster else
+        f"bucket <code>{payload.get('bucket', '?')}</code>"
+    )
+
+    return (
+        f"<b>{headline} breached — alpha rejected</b>\n"
+        f"{key_label}\n"
+        f"strategy <code>{payload.get('strategy_slug', '?')}</code> · "
+        f"{payload.get('venue', '?')} <code>{payload.get('asset', '?')}</code>\n"
+        f"current ${current:,.0f} + proposed ${proposed:,.0f} = "
+        f"${would_be:,.0f} > cap ${cap:,.0f}\n"
+        f"<i>Trade did NOT enter — concentration guard fired.</i>"
+    )
+
+
 def format_critical(s: Signal) -> str:
     """Rich format for a signals:critical message."""
     direction_emoji = {"long": "📈", "short": "📉", "neutral": "➖", "watch": "👀"}.get(

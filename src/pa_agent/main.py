@@ -254,6 +254,157 @@ async def auto_disable_loop() -> None:
         await asyncio.sleep(settings.auto_disable_check_interval_sec)
 
 
+# ─── Loop 6c: position-aging alerts (Phase 8 v0.10) ───────────────────────
+
+
+async def position_aging_loop() -> None:
+    """Scan open positions every N minutes; ping Telegram once per
+    (position, age-tier) crossing so the operator notices stuck opens.
+
+    Polymarket positions are excluded — they're resolution-bound and
+    the settlement loop already alerts when those close.
+
+    Sent-alert keys are tracked in a Redis set with a TTL so closed
+    positions' keys naturally expire instead of accumulating forever.
+    """
+    if not settings.position_aging_enabled:
+        log.info("position-aging loop: disabled via setting")
+        return
+    from pa_agent import aging
+
+    r = aioredis.from_url(settings.redis_url, decode_responses=True)
+    log.info(
+        "position-aging loop starting; interval=%ds, redis_set=%s",
+        settings.position_aging_check_interval_sec,
+        settings.position_aging_redis_set,
+    )
+
+    while True:
+        try:
+            if settings.pa_agent_halt:
+                await asyncio.sleep(settings.position_aging_check_interval_sec)
+                continue
+            try:
+                rows = await db.open_positions_for_aging()
+            except Exception:
+                log.exception("position-aging.db_query_failed")
+                await asyncio.sleep(settings.position_aging_check_interval_sec)
+                continue
+
+            try:
+                already = await r.smembers(settings.position_aging_redis_set)
+                already_set = set(already) if already else set()
+            except Exception:
+                log.exception("position-aging.redis_smembers_failed")
+                already_set = set()
+
+            now = aging.now_utc()
+            new_alerts = aging.evaluate_aging(
+                [dict(row) for row in rows],
+                now=now,
+                already_alerted=already_set,
+            )
+
+            if new_alerts:
+                try:
+                    body = aging.format_aging_alert(new_alerts)
+                    await alerts.telegram(body)
+                    log.info(
+                        "position-aging: sent alert for %d positions", len(new_alerts)
+                    )
+                except Exception:
+                    log.exception("position-aging.telegram_send_failed")
+                else:
+                    # Mark each alerted (position, tier) so we don't re-ping.
+                    for a in new_alerts:
+                        try:
+                            await r.sadd(settings.position_aging_redis_set, a.alert_key)
+                            await r.expire(
+                                settings.position_aging_redis_set,
+                                settings.position_aging_alert_ttl_sec,
+                            )
+                        except Exception:
+                            log.exception(
+                                "position-aging.sadd_failed key=%s", a.alert_key
+                            )
+        except Exception:
+            log.exception("position-aging cycle failed")
+        await asyncio.sleep(settings.position_aging_check_interval_sec)
+
+
+# ─── Loop 6d: cap-breach alerts (Phase 8 v0.11) ───────────────────────────
+
+
+async def cap_breach_loop() -> None:
+    """XREAD risk:cap_breaches → Telegram. Rate-limited per (reason, key)
+    so a runaway pulse doesn't blow up our chat — first breach in the
+    window pings, the rest get absorbed silently."""
+    if not settings.cap_breach_alerts_enabled:
+        log.info("cap-breach loop: disabled via setting")
+        return
+
+    r = aioredis.from_url(settings.redis_url, decode_responses=True)
+    last_id = "$"
+    log.info(
+        "cap-breach loop starting; stream=%s rate_limit=%ds",
+        settings.cap_breach_alerts_stream,
+        settings.cap_breach_alert_rate_limit_sec,
+    )
+
+    last_alert_ts: dict[str, datetime] = {}
+
+    while True:
+        try:
+            if settings.pa_agent_halt:
+                await asyncio.sleep(5)
+                continue
+            try:
+                result = await r.xread(
+                    {settings.cap_breach_alerts_stream: last_id},
+                    block=5_000, count=20,
+                )
+            except Exception:
+                log.exception("cap-breach.xread_failed")
+                await asyncio.sleep(5)
+                continue
+            if not result:
+                continue
+
+            for _stream_name, entries in result:
+                for entry_id, fields in entries:
+                    last_id = entry_id
+                    raw = fields.get("data")
+                    if not raw:
+                        continue
+                    try:
+                        payload = json.loads(raw)
+                    except Exception:
+                        log.exception("cap-breach.bad_payload entry=%s", entry_id)
+                        continue
+
+                    reason = payload.get("reason", "?")
+                    key = payload.get("cluster") or payload.get("bucket") or "?"
+                    rl_key = f"{reason}:{key}"
+                    now = datetime.now(UTC)
+                    last = last_alert_ts.get(rl_key)
+                    if last is not None:
+                        elapsed = (now - last).total_seconds()
+                        if elapsed < settings.cap_breach_alert_rate_limit_sec:
+                            continue
+                    last_alert_ts[rl_key] = now
+
+                    try:
+                        await alerts.telegram(alerts.format_cap_breach(payload))
+                        log.info(
+                            "cap-breach.alert_sent reason=%s key=%s", reason, key,
+                        )
+                    except Exception:
+                        log.exception("cap-breach.telegram_failed")
+        except Exception:
+            log.exception("cap-breach loop tick failed")
+            await asyncio.sleep(5)
+
+
 # ─── Loop 7: alpha fire alerts (Phase 8 v0.8) ─────────────────────────────
 
 
@@ -416,6 +567,8 @@ async def main() -> None:
     _setup_logging()
     log.info("pa-agent starting (halt=%s)", settings.pa_agent_halt)
     await db.connect()
+    # Lazy import keeps monitoring optional — module fail doesn't kill pa-agent
+    from pa_agent import monitoring
     try:
         await asyncio.gather(
             critical_loop(),
@@ -427,6 +580,13 @@ async def main() -> None:
             alpha_alert_loop(),
             eod_digest_loop(),
             auto_disable_loop(),
+            position_aging_loop(),
+            cap_breach_loop(),
+            # 2026-05-17 daily monitoring — 4 new loops
+            monitoring.decay_halt_alert_loop(),
+            monitoring.kelly_outlier_loop(),
+            monitoring.bankroll_tier_loop(),
+            monitoring.oracle_latency_loop(),
         )
     finally:
         await db.close()
