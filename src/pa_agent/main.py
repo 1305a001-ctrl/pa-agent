@@ -239,16 +239,59 @@ async def auto_disable_loop() -> None:
                 )
                 if decision.should_halt:
                     try:
+                        # 1. Add to the SET (alpha-fusion reads this — blocks
+                        #    alphas that flow through fusion's ingest).
                         await r.sadd(settings.auto_disable_redis_halt_set, slug)
+                        # 2. Also set the per-strategy KEY (oms-gateway preflight
+                        #    reads this — blocks alphas going DIRECTLY to
+                        #    alphas:active, which is the path chainlink_lag uses).
+                        #    Discovered 2026-05-19 post-mortem: the SET alone was
+                        #    decorative for chainlink_lag because it bypasses
+                        #    alpha-fusion entirely.
+                        oms_key = (
+                            f"{settings.auto_disable_oms_halt_key_prefix}:{slug}"
+                        )
+                        await r.set(
+                            oms_key,
+                            "auto_disable_halt",
+                            ex=settings.auto_disable_oms_halt_ttl_sec,
+                        )
                         await alerts.telegram(
                             auto_disable.format_halt_alert(slug, decision)
                         )
                         log.warning(
-                            "auto-disable: HALTED slug=%s reason=%s",
-                            slug, decision.reason,
+                            "auto-disable: HALTED slug=%s reason=%s "
+                            "(SET + KEY %s)",
+                            slug, decision.reason, oms_key,
                         )
                     except Exception:
                         log.exception("auto-disable.halt_publish_failed slug=%s", slug)
+                elif decision.should_warn:
+                    # Proactive warning: not halted, but one step away. Suppress
+                    # repeated warnings within auto_disable_warn_suppress_ttl_sec
+                    # to avoid spamming the same alert every 5min cycle.
+                    suppress_key = (
+                        f"{settings.auto_disable_warn_suppress_key_prefix}:{slug}"
+                    )
+                    try:
+                        # SET NX with TTL — if key already exists, this returns
+                        # falsy and we skip the alert.
+                        claimed = await r.set(
+                            suppress_key,
+                            str(decision.consecutive_losses),
+                            nx=True,
+                            ex=settings.auto_disable_warn_suppress_ttl_sec,
+                        )
+                        if claimed:
+                            await alerts.telegram(
+                                auto_disable.format_streak_warning(slug, decision)
+                            )
+                            log.info(
+                                "auto-disable: WARN slug=%s reason=%s",
+                                slug, decision.warn_reason,
+                            )
+                    except Exception:
+                        log.exception("auto-disable.warn_publish_failed slug=%s", slug)
         except Exception:
             log.exception("auto-disable cycle failed")
         await asyncio.sleep(settings.auto_disable_check_interval_sec)

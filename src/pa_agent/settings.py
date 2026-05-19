@@ -71,6 +71,17 @@ class Settings(BaseSettings):
     auto_disable_consecutive_loss_threshold: int = 5
     auto_disable_realized_24h_threshold: float = -100.0  # halts when 24h ≤ -$100
     auto_disable_redis_halt_set: str = "strategy:halts"
+    # oms-gateway preflight reads `system:halt:strategy:<slug>` keys (NOT
+    # the set). Both have to be written for the halt to actually block
+    # trades for strategies that emit directly to alphas:active (chainlink_lag).
+    # The set alone was decorative — discovered 2026-05-19 post-mortem.
+    auto_disable_oms_halt_key_prefix: str = "system:halt:strategy"
+    auto_disable_oms_halt_ttl_sec: int = 60 * 60 * 24 * 7  # 7 days
+    # Per-strategy warn-suppression: don't re-fire the streak warning more
+    # than once per N seconds for the same slug. Stops the 5-min auto-disable
+    # cycle from spamming the same warning every tick.
+    auto_disable_warn_suppress_key_prefix: str = "pa_agent:auto_disable_warned"
+    auto_disable_warn_suppress_ttl_sec: int = 60 * 30  # 30 min
     # Strategies to monitor (CSV). Empty defaults to known poly strategies.
     auto_disable_strategies: str = (
         "poly-fade-extreme,poly-liq-cascade-taker-daily,"

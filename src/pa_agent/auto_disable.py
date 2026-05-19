@@ -32,6 +32,11 @@ class DisableDecision:
     consecutive_losses: int
     realized_24h: float
     n_closed_24h: int
+    # Proactive warning when we're one trade away from halt — gives operator
+    # a chance to intervene before the safety net triggers. Added 2026-05-19
+    # post-mortem after a 6-loss streak ran to completion before halt fired.
+    should_warn: bool = False
+    warn_reason: str = ""
 
 
 def evaluate_strategy_halt(
@@ -41,7 +46,7 @@ def evaluate_strategy_halt(
     consecutive_loss_threshold: int,
     realized_24h_threshold: float,
 ) -> DisableDecision:
-    """Pure: decide whether a strategy should be auto-halted.
+    """Pure: decide whether a strategy should be auto-halted, OR warned.
 
     `recent_closed_pnls` — newest-first list of realized PnLs on the last
     N closed positions. Counts consecutive losses from the front.
@@ -52,8 +57,14 @@ def evaluate_strategy_halt(
       - consecutive_losses >= consecutive_loss_threshold, OR
       - sum(pnls_24h) <= realized_24h_threshold (a negative number)
 
+    Warns (without halting) when:
+      - consecutive_losses == consecutive_loss_threshold - 1
+        (one short of halt — proactive notice so operator can intervene)
+      - sum(pnls_24h) is between 60-100% of the realized_24h_threshold
+        (approaching the 24h damage cap)
+
     Both thresholds need to be reasonably loose so that healthy strategies
-    don't get tripped on noise.
+    don't get tripped on noise; the warn level is one step tighter.
     """
     consecutive = 0
     for pnl in recent_closed_pnls:
@@ -74,13 +85,33 @@ def evaluate_strategy_halt(
         reasons.append(
             f"24h realized PnL ${realized_24h:+.2f} ≤ ${realized_24h_threshold:+.2f}"
         )
+    should_halt = bool(reasons)
+
+    # Proactive warning: one short of halt threshold OR 60-100% of 24h damage cap.
+    warn_reasons: list[str] = []
+    if not should_halt:
+        if consecutive_loss_threshold >= 2 and consecutive == consecutive_loss_threshold - 1:
+            warn_reasons.append(
+                f"{consecutive} consecutive losses — one more triggers halt"
+            )
+        # 24h drawdown approaching cap (60-100% of threshold)
+        if realized_24h_threshold < 0:
+            # threshold is negative (e.g. -100); compute fraction toward cap
+            frac = realized_24h / realized_24h_threshold  # both negative → positive
+            if 0.6 <= frac < 1.0:
+                warn_reasons.append(
+                    f"24h drawdown ${realized_24h:+.2f} at {frac*100:.0f}% of cap "
+                    f"${realized_24h_threshold:+.2f}"
+                )
 
     return DisableDecision(
-        should_halt=bool(reasons),
+        should_halt=should_halt,
         reason="; ".join(reasons) if reasons else "ok",
         consecutive_losses=consecutive,
         realized_24h=realized_24h,
         n_closed_24h=n_closed_24h,
+        should_warn=bool(warn_reasons),
+        warn_reason="; ".join(warn_reasons),
     )
 
 
@@ -92,9 +123,28 @@ def format_halt_alert(strategy_slug: str, decision: DisableDecision) -> str:
         f"  consecutive losses: <b>{decision.consecutive_losses}</b>\n"
         f"  24h realized PnL: <b>${decision.realized_24h:+.2f}</b> across "
         f"{decision.n_closed_24h} closed\n\n"
-        f"<i>Strategy added to <code>strategy:halts</code> Redis set.</i>\n"
-        f"<i>Manual override: SREM <code>strategy:halts</code> {strategy_slug}.</i>\n"
+        f"<i>Strategy added to <code>strategy:halts</code> Redis set "
+        f"AND <code>system:halt:strategy:{strategy_slug}</code> key (oms-gateway).</i>\n"
+        f"<i>Manual override: SREM <code>strategy:halts</code> {strategy_slug} "
+        f"AND DEL <code>system:halt:strategy:{strategy_slug}</code>.</i>\n"
         f"<i>Permanent: flip frontmatter status: inactive in strategy-library.</i>"
+    )
+
+
+def format_streak_warning(strategy_slug: str, decision: DisableDecision) -> str:
+    """Pure: HTML-formatted Telegram alert for a near-halt streak warning.
+
+    Fires when we're one trade short of halt or approaching the 24h cap.
+    Does NOT halt — gives operator a chance to intervene before the
+    safety net trips.
+    """
+    return (
+        f"<b>⚠️ Streak warning: {strategy_slug}</b>\n"
+        f"<i>{decision.warn_reason}</i>\n\n"
+        f"  consecutive losses: <b>{decision.consecutive_losses}</b>\n"
+        f"  24h realized PnL: <b>${decision.realized_24h:+.2f}</b> across "
+        f"{decision.n_closed_24h} closed\n\n"
+        f"<i>Not yet halted. One more loss / further drawdown trips auto-halt.</i>"
     )
 
 

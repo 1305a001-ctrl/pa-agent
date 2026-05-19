@@ -8,8 +8,112 @@ from pa_agent.auto_disable import (
     DisableDecision,
     evaluate_strategy_halt,
     format_halt_alert,
+    format_streak_warning,
     parse_pnls_for_24h,
 )
+
+# --- Proactive warning tests (added 2026-05-19 post-mortem) ---
+
+
+class TestProactiveWarning:
+    def test_warns_one_short_of_halt(self):
+        """3-loss threshold; 2 consecutive losses should warn, not halt."""
+        d = evaluate_strategy_halt(
+            recent_closed_pnls=[-5.0, -3.0, 8.0],
+            pnls_24h=[-5.0, -3.0, 8.0],
+            consecutive_loss_threshold=3,
+            realized_24h_threshold=-100.0,
+        )
+        assert d.should_halt is False
+        assert d.should_warn is True
+        assert d.consecutive_losses == 2
+        assert "one more" in d.warn_reason.lower() or "consecutive" in d.warn_reason.lower()
+
+    def test_no_warn_when_far_from_threshold(self):
+        """3-loss threshold; only 1 loss → no warn."""
+        d = evaluate_strategy_halt(
+            recent_closed_pnls=[-5.0, 3.0, 8.0],
+            pnls_24h=[-5.0, 3.0, 8.0],
+            consecutive_loss_threshold=3,
+            realized_24h_threshold=-100.0,
+        )
+        assert d.should_halt is False
+        assert d.should_warn is False
+
+    def test_no_warn_when_already_halted(self):
+        """If halt fires, we don't ALSO emit a warn (halt supersedes)."""
+        d = evaluate_strategy_halt(
+            recent_closed_pnls=[-5.0, -3.0, -10.0, 8.0],
+            pnls_24h=[-5.0, -3.0, -10.0, 8.0],
+            consecutive_loss_threshold=3,
+            realized_24h_threshold=-100.0,
+        )
+        assert d.should_halt is True
+        assert d.should_warn is False  # halt alert covers it
+
+    def test_warn_on_24h_drawdown_approaching_cap(self):
+        """24h PnL at 70% of cap should warn (60-100% range)."""
+        d = evaluate_strategy_halt(
+            recent_closed_pnls=[],
+            pnls_24h=[-70.0],  # 70% of $-100 cap
+            consecutive_loss_threshold=3,
+            realized_24h_threshold=-100.0,
+        )
+        assert d.should_halt is False
+        assert d.should_warn is True
+        assert "cap" in d.warn_reason.lower()
+
+    def test_no_warn_when_drawdown_well_below_cap(self):
+        """24h PnL at 40% of cap should NOT warn (only fires 60-100%)."""
+        d = evaluate_strategy_halt(
+            recent_closed_pnls=[],
+            pnls_24h=[-40.0],  # only 40% of cap
+            consecutive_loss_threshold=3,
+            realized_24h_threshold=-100.0,
+        )
+        assert d.should_warn is False
+
+    def test_warn_with_threshold_2_means_streak_of_1(self):
+        """Lower threshold = lower warn level. threshold=2 → warn at 1."""
+        d = evaluate_strategy_halt(
+            recent_closed_pnls=[-5.0, 3.0],
+            pnls_24h=[-5.0, 3.0],
+            consecutive_loss_threshold=2,
+            realized_24h_threshold=-100.0,
+        )
+        assert d.should_halt is False
+        assert d.should_warn is True
+        assert d.consecutive_losses == 1
+
+    def test_warn_with_threshold_1_does_not_warn(self):
+        """If threshold=1 (halt on any loss), there's no warn band — must always halt."""
+        d = evaluate_strategy_halt(
+            recent_closed_pnls=[-5.0],
+            pnls_24h=[-5.0],
+            consecutive_loss_threshold=1,
+            realized_24h_threshold=-100.0,
+        )
+        # threshold=1 means halt at 1 loss; no separate warn level possible
+        assert d.should_halt is True
+        assert d.should_warn is False
+
+
+class TestFormatStreakWarning:
+    def test_warning_html_has_strategy_and_streak(self):
+        d = DisableDecision(
+            should_halt=False,
+            reason="ok",
+            consecutive_losses=2,
+            realized_24h=-40.0,
+            n_closed_24h=5,
+            should_warn=True,
+            warn_reason="2 consecutive losses — one more triggers halt",
+        )
+        text = format_streak_warning("poly-chainlink-lag", d)
+        assert "poly-chainlink-lag" in text
+        assert "⚠️" in text
+        assert "2" in text
+        assert "Not yet halted" in text
 
 # --- evaluate_strategy_halt ---
 
