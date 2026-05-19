@@ -124,5 +124,26 @@ class Settings(BaseSettings):
     # Lower-urgency items just land in _inbox/triage-YYYY-MM-DD.md silently.
     gmail_telegram_min_urgency: str = "high"  # 'low' | 'medium' | 'high'
 
+    # trading:events forwarder (post-disaster handoff Medium fix).
+    # XREADs the trading:events Redis stream (written by ai-primary daemons
+    # poly-watchdog, poly-win-rate, poly-auto-sell, poly-daily-pnl-digest,
+    # poly-drawdown-monitor) and forwards each event to Telegram as an
+    # out-of-band alert. Default-enabled because operator visibility on the
+    # live chainlink_lag strategy is high-value and the daemons are already
+    # rate-throttled at the source.
+    trading_events_alerts_enabled: bool = True
+    trading_events_stream: str = "trading:events"
+    # Per-kind rate limit (seconds). Non-critical kinds throttled to absorb
+    # bursts of repetitive events. Critical kinds bypass entirely.
+    trading_events_rate_limit_sec: int = 300  # 5 min per kind
+    # Critical kinds bypass rate limit — these must always reach the operator.
+    trading_events_critical_kinds: str = (
+        "drawdown_alert,daily_summary,container_unhealthy,container_crashed,"
+        "fak_reject,whitelist_reject,emergency_halt,crash"
+    )
+    # Kinds dropped entirely (no Telegram). pusd_check fires every ~7.5min
+    # from the watchdog — useful in logs, but spammy in Telegram.
+    trading_events_dropped_kinds: str = "pusd_check,start"
+
 
 settings = Settings()

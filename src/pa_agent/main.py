@@ -524,6 +524,97 @@ async def poly_settle_loop() -> None:
                     log.exception("poly-settle process failed for %s", entry_id)
 
 
+# ─── Loop 15: trading:events forwarder (post-disaster handoff Medium fix) ──
+
+
+async def trading_events_loop() -> None:
+    """XREAD trading:events from $ (latest) and forward each entry to Telegram.
+
+    ai-primary bash daemons (poly-watchdog, poly-win-rate, poly-auto-sell,
+    poly-daily-pnl-digest, poly-drawdown-monitor) XADD operator events to
+    this stream so Ben gets out-of-band alerts even when not SSH'd. Same
+    XREAD-with-backoff shape as corr_alert_loop / poly_settle_loop.
+
+    The forwarder rate-limits per `kind` to absorb noise. Critical kinds
+    (drawdown_alert, daily_summary, container_crashed, etc.) bypass and
+    always alert. Dropped kinds (pusd_check, start) never alert.
+    """
+    if not settings.trading_events_alerts_enabled:
+        log.info("trading-events loop: disabled via setting")
+        return
+
+    critical = {
+        k.strip()
+        for k in (settings.trading_events_critical_kinds or "").split(",")
+        if k.strip()
+    }
+    dropped = {
+        k.strip()
+        for k in (settings.trading_events_dropped_kinds or "").split(",")
+        if k.strip()
+    }
+
+    r = aioredis.from_url(settings.redis_url, decode_responses=True)
+    last_id = "$"
+    backoff = 1.0
+    last_alert_ts: dict[str, datetime] = {}
+    log.info(
+        "trading-events loop starting; stream=%s rate_limit=%ds critical=%s dropped=%s",
+        settings.trading_events_stream,
+        settings.trading_events_rate_limit_sec,
+        sorted(critical), sorted(dropped),
+    )
+
+    while True:
+        try:
+            result = await r.xread(
+                {settings.trading_events_stream: last_id},
+                block=10_000,
+                count=20,
+            )
+        except Exception:
+            log.exception("trading-events XREAD failed")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+            continue
+        backoff = 1.0
+        if not result:
+            continue
+        for _stream_name, entries in result:
+            for entry_id, fields in entries:
+                last_id = entry_id
+                if settings.pa_agent_halt:
+                    continue
+                # Daemons XADD top-level fields (source/kind/msg/ts). If a
+                # producer ever switches to a JSON blob under `data`, decode
+                # that instead — pa-agent's other stream loops do the same.
+                payload: dict = dict(fields)
+                raw = fields.get("data") or fields.get(b"data")
+                if raw:
+                    try:
+                        payload = json.loads(raw)
+                    except Exception:
+                        pass  # fall through to top-level fields
+                kind = (payload.get("kind") or "").strip()
+                if kind in dropped:
+                    continue
+                if kind not in critical:
+                    now = datetime.now(UTC)
+                    last = last_alert_ts.get(kind)
+                    if last is not None and (now - last).total_seconds() < settings.trading_events_rate_limit_sec:
+                        continue
+                    last_alert_ts[kind] = now
+                try:
+                    text = alerts.format_trading_event(payload)
+                    await alerts.telegram(text)
+                    log.info(
+                        "trading-events sent: kind=%s source=%s",
+                        kind, payload.get("source"),
+                    )
+                except Exception:
+                    log.exception("trading-events process failed for %s", entry_id)
+
+
 # ─── Loop 2: daily brief ────────────────────────────────────────────────────
 
 
@@ -587,6 +678,10 @@ async def main() -> None:
             monitoring.kelly_outlier_loop(),
             monitoring.bankroll_tier_loop(),
             monitoring.oracle_latency_loop(),
+            # 2026-05-19 post-disaster — forwards trading:events from
+            # ai-primary bash daemons (watchdog/win-rate/auto-sell/pnl-digest/
+            # drawdown-monitor) to Telegram so Ben gets out-of-band alerts.
+            trading_events_loop(),
         )
     finally:
         await db.close()

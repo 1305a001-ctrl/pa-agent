@@ -297,3 +297,46 @@ def format_critical(s: Signal) -> str:
         lines.append("")
         lines.append(f"<i>Based on {len(s.source_article_ids)} article(s)</i>")
     return "\n".join(lines)
+
+
+TRADING_EVENT_ICONS: dict[str, str] = {
+    "drawdown_alert": "📉",
+    "daily_summary": "📊",
+    "emergency_halt": "🛑",
+    "container_crashed": "💥",
+    "container_unhealthy": "⚠️",
+    "fak_reject": "🚫",
+    "whitelist_reject": "🚧",
+    "rate_limited": "🚦",
+    "win_rate_update": "📈",
+    "emit_milestone": "📡",
+    "crash": "💥",
+    "pusd_check": "💰",
+    "start": "▶️",
+}
+
+
+def format_trading_event(payload: dict) -> str:
+    """Pure: trading:events stream entry → Telegram HTML.
+
+    Payload shape (ai-primary bash daemons XADD with these top-level fields):
+      source : "watchdog" | "win_rate" | "auto_sell" | "daily_pnl_digest" |
+               "drawdown_monitor"
+      kind   : event-kind tag (e.g. "drawdown_alert", "win_rate_update")
+      msg    : human-readable text already formatted by the source daemon
+      ts     : unix epoch seconds (string, optional)
+
+    Daemons emit pre-formatted msgs, so this just adds an icon + source
+    attribution and lets the operator scan kind at a glance.
+    """
+    kind = (payload.get("kind") or "?").strip()
+    source = (payload.get("source") or "?").strip()
+    msg = (payload.get("msg") or "(no msg)").strip()
+    icon = TRADING_EVENT_ICONS.get(kind, "•")
+    # Pre-escape any HTML-meaningful chars in msg so Telegram parse_mode=HTML
+    # doesn't choke on a stray < or & in dynamic numbers.
+    safe_msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (
+        f"<b>{icon} {kind}</b> <i>via {source}</i>\n"
+        f"<code>{safe_msg}</code>"
+    )
