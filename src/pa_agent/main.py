@@ -601,7 +601,8 @@ async def trading_events_loop() -> None:
                 if kind not in critical:
                     now = datetime.now(UTC)
                     last = last_alert_ts.get(kind)
-                    if last is not None and (now - last).total_seconds() < settings.trading_events_rate_limit_sec:
+                    rate_limit = settings.trading_events_rate_limit_sec
+                    if last is not None and (now - last).total_seconds() < rate_limit:
                         continue
                     last_alert_ts[kind] = now
                 try:

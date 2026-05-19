@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from pa_agent import monitoring as mon
 
-
 # ─── format_decay_halt ────────────────────────────────────────────────
 
 
